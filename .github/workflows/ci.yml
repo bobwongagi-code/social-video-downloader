@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Compile downloader script
+        run: python3 -m py_compile scripts/download_social_video.py
+
+      - name: Validate repository metadata
+        run: python3 scripts/validate_repo.py
+
+      - name: Check diff formatting
+        run: git diff --check

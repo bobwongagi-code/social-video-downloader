@@ -7,6 +7,13 @@ This repo contains both:
 - A Codex skill for natural-language download requests
 - A bundled Python downloader script built around `yt-dlp` and `ffmpeg`
 
+Project docs:
+
+- [CHANGELOG](./CHANGELOG.md)
+- [CONTRIBUTING](./CONTRIBUTING.md)
+- [SECURITY](./SECURITY.md)
+- [LICENSE](./LICENSE)
+
 ## Why This Exists
 
 Most video download setups break down in real work:
@@ -140,6 +147,7 @@ Local runtime artifacts are intentionally ignored:
 
 ## Notes
 
+- This project is not affiliated with TikTok, Instagram, Facebook, X/Twitter, YouTube, or Xiaohongshu.
 - Some platforms require login state depending on region and content restrictions.
 - Restricted sources may expose only audio; those are treated as failures instead of fake success.
 - The defaults are optimized for day-to-day sharing, playback, and presentation use, not archival-quality collection.
