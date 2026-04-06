@@ -93,6 +93,21 @@ Use a logged-in browser session when needed:
 python3 scripts/download_social_video.py "<url>" --cookies-from-browser chrome
 ```
 
+## Example Workflow
+
+Typical day-to-day usage looks like this:
+
+```bash
+# 1. Download a single social-media URL
+python3 scripts/download_social_video.py "https://www.instagram.com/reel/..."
+
+# 2. Download a small batch with bounded concurrency
+python3 scripts/download_social_video.py "https://x.com/i/status/..." "https://www.youtube.com/watch?v=..." --concurrency 3
+
+# 3. Review recent real-run KPI trends
+python3 scripts/download_social_video.py --kpi-report
+```
+
 ## Common Flags
 
 - `--output-dir`: write files somewhere other than `~/Downloads`
