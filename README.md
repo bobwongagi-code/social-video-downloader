@@ -1,18 +1,33 @@
 # Social Video Downloader
 
-Download social-media videos to the local `~/Downloads` folder with practical defaults for repeated work:
+A practical social-media video downloader for everyday work: save videos to `~/Downloads` with audio included, balanced quality, and output that already works in QuickTime Player and PowerPoint.
 
-- Balanced quality instead of maximum bitrate or resolution
-- Audio included whenever the source exposes audio
-- Final output normalized for QuickTime Player and PowerPoint
-- Stable handling for social pages, direct media URLs, and HLS playlists
-- Lightweight cache and KPI logging for repeated use and tuning
+This repo contains both:
 
-This repo contains the Codex skill plus the bundled downloader script that powers it.
+- A Codex skill for natural-language download requests
+- A bundled Python downloader script built around `yt-dlp` and `ffmpeg`
+
+## Why This Exists
+
+Most video download setups break down in real work:
+
+- They grab the highest bitrate when you only need something practical
+- They download video without audio
+- They produce files that play in IINA but fail in QuickTime or PowerPoint
+- They work on simple MP4 links but get flaky on social pages or HLS streams
+
+This project is designed around a different goal: stable, presentation-friendly downloads with sensible defaults.
+
+## Highlights
+
+- Balanced output: targets practical file size and speed instead of max quality
+- Audio-aware: prefers video+audio combinations and avoids silent outputs
+- Presentation-ready: normalizes to `H.264 + AAC` only when needed
+- Stable download paths: separates social pages, direct media URLs, and HLS playlists
+- Recovery built in: supports retries, cookie fallback, HLS stall detection, and segmented fallback
+- Repeated-work friendly: includes cache reuse and lightweight KPI logging
 
 ## What It Supports
-
-The downloader is built around `yt-dlp` plus `ffmpeg`.
 
 Typical supported sources include:
 
@@ -54,34 +69,28 @@ git clone git@github-personal:bobwongagi-code/social-video-downloader.git
 cd social-video-downloader
 ```
 
-Run a basic download:
+Download one URL:
 
 ```bash
 python3 scripts/download_social_video.py "<url>"
 ```
 
-Download multiple links:
+Download a batch:
 
 ```bash
 python3 scripts/download_social_video.py "<url-1>" "<url-2>"
+```
+
+See recent KPI trends from real runs:
+
+```bash
+python3 scripts/download_social_video.py --kpi-report
 ```
 
 Use a logged-in browser session when needed:
 
 ```bash
 python3 scripts/download_social_video.py "<url>" --cookies-from-browser chrome
-```
-
-Preview a batch without downloading:
-
-```bash
-python3 scripts/download_social_video.py "download these https://... and https://..." --dry-run
-```
-
-Show KPI summary for recent real runs:
-
-```bash
-python3 scripts/download_social_video.py --kpi-report
 ```
 
 ## Common Flags
@@ -92,6 +101,7 @@ python3 scripts/download_social_video.py --kpi-report
 - `--cookies-from-browser`: force a specific browser cookie source
 - `--concurrency`: control bounded parallel downloads for multi-URL batches
 - `--dry-run`: preview without downloading
+- `--kpi-report`: summarize recent real-run metrics
 - `--version`: print the script version
 
 ## Repository Layout
