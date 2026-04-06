@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+*.swp
+*.swo
+.DS_Store
+*.log
+*.tmp
+*.temp
+*.bak
+*.orig
+.env
+.env.*
+cache/
+metrics/

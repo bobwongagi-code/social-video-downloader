@@ -1,0 +1,4 @@
+interface:
+  display_name: "Social Video Downloader"
+  short_description: "Download social videos with balanced quality."
+  default_prompt: "Download the provided TikTok, Instagram, Facebook, X/Twitter, or YouTube video to Downloads with balanced quality, audio, and PowerPoint-compatible output."
