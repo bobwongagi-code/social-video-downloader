@@ -144,7 +144,8 @@ Local runtime artifacts are intentionally ignored:
 - Restricted sources may expose only audio; those are treated as failures instead of fake success.
 - The defaults are optimized for day-to-day sharing, playback, and presentation use, not archival-quality collection.
 - KPI reports exclude `--dry-run` events from scoring so the metrics stay meaningful.
+- Users are responsible for complying with the target platform's terms of service and local laws when downloading content.
 
 ## License
 
-No license file is included yet. Treat this repo as private/internal until you decide how you want to share it.
+This project is licensed under the MIT License. See [LICENSE](./LICENSE).
