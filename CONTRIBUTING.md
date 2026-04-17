@@ -33,6 +33,10 @@ python3 scripts/validate_repo.py
 git diff --check
 ```
 
+For manual stability checks against real long-running platform samples, see:
+
+- `docs/samples/high-difficulty-cases.md`
+
 ## Pull Request Guidelines
 
 - Keep the scope tight
