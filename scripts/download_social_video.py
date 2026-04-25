@@ -15,7 +15,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from pathlib import PureWindowsPath
-from urllib.parse import parse_qsl, unquote, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse, urlunparse
 
 
 __version__ = "0.3.1"
@@ -34,6 +34,7 @@ DIRECT_MEDIA_EXTENSIONS = (".mp4", ".m4v", ".mov", ".webm", ".m3u8")
 HLS_STALL_SECONDS = 20
 HLS_PROGRESS_POLL_SECONDS = 2
 HLS_SEGMENT_WORKERS = 4
+HLS_MAX_PLAYLIST_DEPTH = 3
 URL_WORKERS = 3
 CACHE_PATH = Path.home() / ".codex" / "skills" / "social-video-downloader" / "cache" / "downloads.json"
 METRICS_LOG_PATH = Path.home() / ".codex" / "skills" / "social-video-downloader" / "metrics" / "runs.jsonl"
@@ -475,12 +476,64 @@ def direct_media_target(url: str, args: argparse.Namespace) -> Path:
 
 
 def build_segment_url(playlist_url: str, segment: str) -> str:
-    parsed = urlparse(playlist_url)
-    base_path = parsed.path.rsplit("/", 1)[0] + "/"
-    query = f"?{parsed.query}" if parsed.query else ""
-    if segment.startswith("http://") or segment.startswith("https://"):
-        return segment
-    return f"{parsed.scheme}://{parsed.netloc}{base_path}{segment}{query}"
+    resolved = urljoin(playlist_url, segment)
+    parsed_segment = urlparse(segment)
+    base_query = urlparse(playlist_url).query
+    if parsed_segment.query or not base_query:
+        return resolved
+    resolved_parsed = urlparse(resolved)
+    return urlunparse(resolved_parsed._replace(query=base_query))
+
+
+def parse_hls_attribute_list(text: str) -> dict[str, str]:
+    attributes: dict[str, str] = {}
+    for part in text.split(","):
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        attributes[key.strip().upper()] = value.strip().strip('"')
+    return attributes
+
+
+def extract_hls_playlist_entries(playlist_text: str) -> tuple[list[str], list[tuple[int, str]]]:
+    media_segments: list[str] = []
+    variants: list[tuple[int, str]] = []
+    pending_variant_bandwidth: int | None = None
+
+    for raw_line in playlist_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("#EXT-X-STREAM-INF:"):
+            attrs = parse_hls_attribute_list(line.split(":", 1)[1])
+            try:
+                pending_variant_bandwidth = int(attrs.get("BANDWIDTH", "0"))
+            except ValueError:
+                pending_variant_bandwidth = 0
+            continue
+        if line.startswith("#"):
+            continue
+        if pending_variant_bandwidth is not None:
+            variants.append((pending_variant_bandwidth, line))
+            pending_variant_bandwidth = None
+            continue
+        media_segments.append(line)
+
+    return media_segments, variants
+
+
+def resolve_hls_media_playlist_url(playlist_url: str) -> str:
+    current_url = playlist_url
+    for _ in range(HLS_MAX_PLAYLIST_DEPTH):
+        playlist_text = fetch_text_via_curl(current_url)
+        media_segments, variants = extract_hls_playlist_entries(playlist_text)
+        if media_segments:
+            return current_url
+        if not variants:
+            break
+        _, selected_variant = max(variants, key=lambda item: item[0])
+        current_url = build_segment_url(current_url, selected_variant)
+    raise RuntimeError("HLS playlist did not resolve to media segments.")
 
 
 def fetch_text_via_curl(url: str) -> str:
@@ -536,18 +589,15 @@ def download_hls_via_segments(url: str, destination: Path, ffmpeg: str) -> tuple
         parts_dir = temp_root / "parts"
         parts_dir.mkdir(parents=True, exist_ok=True)
 
-        playlist_text = fetch_text_via_curl(url)
-        segments = [
-            line.strip()
-            for line in playlist_text.splitlines()
-            if line.strip() and not line.startswith("#")
-        ]
+        media_playlist_url = resolve_hls_media_playlist_url(url)
+        playlist_text = fetch_text_via_curl(media_playlist_url)
+        segments, _ = extract_hls_playlist_entries(playlist_text)
         if not segments:
             return False, None, "HLS playlist contained no media segments."
 
         def fetch_segment(item: tuple[int, str]) -> None:
             index, segment = item
-            segment_url = build_segment_url(url, segment)
+            segment_url = build_segment_url(media_playlist_url, segment)
             segment_path = parts_dir / f"{index:05d}.ts"
             download_file_via_curl(segment_url, segment_path)
 
@@ -839,6 +889,10 @@ def has_video_stream(path: str, ffmpeg: str) -> bool:
     return result.returncode == 0 and "video" in result.stdout
 
 
+def has_audio_stream(path: str, ffmpeg: str) -> bool:
+    return bool(probe_audio_codec(path, ffmpeg))
+
+
 def make_powerpoint_compatible(input_path: str, ffmpeg: str) -> tuple[str, bool]:
     source = Path(input_path)
     video_info = probe_video_info(str(source), ffmpeg)
@@ -905,7 +959,13 @@ def probe_audio_codec(path: str, ffmpeg: str) -> str:
 
 def cached_file_is_usable(path: str, ffmpeg: str) -> bool:
     candidate = Path(path)
-    return candidate.exists() and candidate.is_file() and candidate.stat().st_size > 0 and has_video_stream(path, ffmpeg)
+    return (
+        candidate.exists()
+        and candidate.is_file()
+        and candidate.stat().st_size > 0
+        and has_video_stream(path, ffmpeg)
+        and has_audio_stream(path, ffmpeg)
+    )
 
 
 def cache_entry_is_fresh(entry: dict[str, str]) -> bool:
@@ -1069,7 +1129,8 @@ def process_url(
 
     if ok:
         saved_path = detail or f"Saved under {output_dir}"
-        if detail and not has_video_stream(detail, ffmpeg):
+        facts = media_facts(detail, ffmpeg) if detail else media_facts(None, ffmpeg)
+        if detail and not facts["has_video"]:
             duration_ms = int((time.monotonic() - started_at) * 1000)
             Path(detail).unlink(missing_ok=True)
             metadata = {
@@ -1084,6 +1145,25 @@ def process_url(
                 url,
                 False,
                 "restricted_audio_only: Downloaded media contained no video stream. The platform currently exposed only audio for this URL; try a logged-in browser session or a different extractor path.",
+                None,
+                None,
+                metadata,
+            )
+        if detail and not facts["has_audio"]:
+            duration_ms = int((time.monotonic() - started_at) * 1000)
+            Path(detail).unlink(missing_ok=True)
+            metadata = {
+                "duration_ms": duration_ms,
+                "from_cache": False,
+                "used_cookies": extra not in {"none", "direct"} and not extra.startswith("success_direct_hls_fallback"),
+                "used_fallback": extra.startswith("success_direct_hls_fallback"),
+                "transcoded": False,
+                "error_category": "restricted_audio_only",
+            }
+            return (
+                url,
+                False,
+                "restricted_audio_only: Downloaded media contained no audio stream. The source did not provide a usable video-with-audio result for this URL.",
                 None,
                 None,
                 metadata,

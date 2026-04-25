@@ -57,7 +57,7 @@ Platform support ultimately depends on whether the current `yt-dlp` extractor ca
 - Playback compatibility: convert to `H.264 + AAC` only when needed
 - Cookies: retry with available local browser cookies when anonymous access fails
 - HLS: try fast `ffmpeg` capture first, then fall back to segmented recovery if needed
-- Cache: reuse a previously downloaded file only if it still exists and passes a basic media sanity check
+- Cache: reuse a previously downloaded file only if it still exists and still contains both video and audio
 
 ## Requirements
 
@@ -72,7 +72,7 @@ On macOS, the script can auto-install missing `yt-dlp` and `ffmpeg` with Homebre
 Clone the repo:
 
 ```bash
-git clone git@github-personal:bobwongagi-code/social-video-downloader.git
+git clone git@github.com:bobwongagi-code/social-video-downloader.git
 cd social-video-downloader
 ```
 

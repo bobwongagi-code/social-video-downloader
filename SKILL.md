@@ -26,7 +26,7 @@ python3 "${CODEX_HOME:-$HOME/.codex}/skills/social-video-downloader/scripts/down
 9. Ensure audio is present. Prefer `video+audio` merged into MP4 when possible, and fall back to progressive formats that already contain audio.
 10. Convert the downloaded result to PowerPoint-compatible `H.264 + AAC` MP4 unless the user explicitly says not to, but skip the re-encode entirely when the downloaded file is already compatible.
 11. Let the script auto-retry with browser cookies when anonymous access fails. If a specific browser matters, pass `--cookies-from-browser`. Otherwise, only try browsers that actually appear to exist on the machine.
-12. Reuse a previously downloaded local file for the same URL when the cache says it exists and the file still passes a basic media sanity check. This improves speed without sacrificing confidence.
+12. Reuse a previously downloaded local file for the same URL only when the cache says it exists and the file still contains both video and audio. This improves speed without sacrificing confidence.
 13. Read the download summary and report back which files succeeded and where they were saved.
 14. Treat TikTok Shop and similar restricted social-commerce URLs specially: if the platform exposes only audio and no video stream, report that the source appears restricted instead of pretending the download succeeded.
 15. For multi-URL work, keep parallelism bounded, show per-URL start/finish updates during the run, and preserve the final summary in the original input order.
@@ -61,7 +61,7 @@ Do not require the user to mention the skill name. The combination of a supporte
 - Restricted-source behavior: if a supported platform only exposes an audio stream and no video stream, treat the download as failed; this is especially common with TikTok Shop or other protected commerce/media pages
 - Retry behavior: use extractor, file, and fragment retries plus concurrent fragment downloads to improve resilience and speed on unstable HLS/media endpoints
 - Result behavior: summarize outcomes with stable status labels such as direct success, HLS fallback success, auth-needed failure, network instability, or restricted audio-only failure
-- Cache behavior: reuse previously downloaded successful outputs only when the cached file still exists and still contains a video stream
+- Cache behavior: reuse previously downloaded successful outputs only when the cached file still exists and still contains both video and audio
 - Batch UX behavior: print progress as each URL starts or finishes, and group the final summary by success, cache hit, auth issues, network instability, restricted source, and invalid input
 - KPI behavior: record lightweight per-run metrics locally and expose a CLI report so the downloader can be tuned against delivery, speed, cache-hit, and fallback-recovery goals; `--dry-run` events are logged but excluded from KPI scoring
 

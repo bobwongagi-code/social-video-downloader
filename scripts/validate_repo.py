@@ -18,6 +18,7 @@ REQUIRED_FILES = [
     "_meta.json",
     "agents/openai.yaml",
     "scripts/download_social_video.py",
+    "tests/test_download_social_video.py",
 ]
 
 
