@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 This changelog starts from the current public-repository baseline.
 
+## [0.4.0] - 2026-05-26
+
+### Added
+
+- HTTP-only TikTok resolver fallback through SnapTik and SSSTik for failed or unusable local extraction results
+- `--tiktok-shop` routing for known Shop/promoted videos and `--no-tiktok-resolver` opt-out
+- Offline tests for resolver decoding and TikTok fallback routing
+
+### Changed
+
+- Resolver-returned media is accepted only after the same video-and-audio validation used by existing downloads
+
 ## [0.3.1] - 2026-04-06
 
 ### Added

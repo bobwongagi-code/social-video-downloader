@@ -18,18 +18,20 @@ python3 "${CODEX_HOME:-$HOME/.codex}/skills/social-video-downloader/scripts/down
 1. Accept one or more URLs from TikTok, Instagram, Facebook, X/Twitter, YouTube, or YouTube Shorts.
 2. Save output to `~/Downloads` unless the user explicitly asks for another directory.
 3. Use the bundled script instead of hand-writing `yt-dlp` commands.
-4. Route social-media page URLs through `yt-dlp`, but route direct media URLs such as `.m3u8` and `.mp4` through the script's dedicated direct-download path instead of forcing page-extractor logic.
-5. Prefer balanced quality capped at roughly 720p for normal social-page downloads. Do not intentionally download the highest available bitrate or resolution unless the user asks for it.
-6. For direct media URLs, prioritize stable capture over format negotiation. Download the supplied media stream directly, then only normalize it afterward if compatibility work is needed.
-7. For direct `.m3u8` URLs, try fast `ffmpeg` capture first. If that fails or stalls without making file-size progress for a while, fall back to downloading the playlist segments and merging them so unstable CDN/HLS links still have a recovery path.
-8. Keep the HLS fallback conservative but not slow: use a small bounded worker pool for segment downloads so recovery is faster without turning into an unstable high-concurrency fetch storm.
-9. Ensure audio is present. Prefer `video+audio` merged into MP4 when possible, and fall back to progressive formats that already contain audio.
-10. Convert the downloaded result to PowerPoint-compatible `H.264 + AAC` MP4 unless the user explicitly says not to, but skip the re-encode entirely when the downloaded file is already compatible.
-11. Let the script auto-retry with browser cookies when anonymous access fails. If a specific browser matters, pass `--cookies-from-browser`. Otherwise, only try browsers that actually appear to exist on the machine.
-12. Reuse a previously downloaded local file for the same URL only when the cache says it exists and the file still contains both video and audio. This improves speed without sacrificing confidence.
-13. Read the download summary and report back which files succeeded and where they were saved.
-14. Treat TikTok Shop and similar restricted social-commerce URLs specially: if the platform exposes only audio and no video stream, report that the source appears restricted instead of pretending the download succeeded.
-15. For multi-URL work, keep parallelism bounded, show per-URL start/finish updates during the run, and preserve the final summary in the original input order.
+4. Route normal social-media page URLs through `yt-dlp`, but route direct media URLs such as `.m3u8` and `.mp4` through the script's dedicated direct-download path instead of forcing page-extractor logic.
+5. For a TikTok URL explicitly described as Shop, promoted, commerce, or restricted, pass `--tiktok-shop` so the script uses its HTTP resolver providers before ordinary TikTok extraction. Do not use browser automation for this first-stage path.
+6. For other TikTok URLs, keep `yt-dlp` as the first path; if it fails or produces unusable audio-only/no-audio output, let the script retry through the HTTP resolver providers automatically.
+7. Prefer balanced quality capped at roughly 720p for normal social-page downloads. Do not intentionally download the highest available bitrate or resolution unless the user asks for it.
+8. For direct media URLs, prioritize stable capture over format negotiation. Download the supplied media stream directly, then only normalize it afterward if compatibility work is needed.
+9. For direct `.m3u8` URLs, try fast `ffmpeg` capture first. If that fails or stalls without making file-size progress for a while, fall back to downloading the playlist segments and merging them so unstable CDN/HLS links still have a recovery path.
+10. Keep the HLS fallback conservative but not slow: use a small bounded worker pool for segment downloads so recovery is faster without turning into an unstable high-concurrency fetch storm.
+11. Ensure audio is present. Prefer `video+audio` merged into MP4 when possible, and fall back to progressive formats that already contain audio.
+12. Convert the downloaded result to PowerPoint-compatible `H.264 + AAC` MP4 unless the user explicitly says not to, but skip the re-encode entirely when the downloaded file is already compatible.
+13. Let the script auto-retry with browser cookies when anonymous access fails. If a specific browser matters, pass `--cookies-from-browser`. Otherwise, only try browsers that actually appear to exist on the machine.
+14. Reuse a previously downloaded local file for the same URL only when the cache says it exists and the file still contains both video and audio. This improves speed without sacrificing confidence.
+15. Read the download summary and report back which files succeeded and where they were saved.
+16. Treat resolver results as untrusted until the final file passes both video-stream and audio-stream validation; never report an audio-only result as success.
+17. For multi-URL work, keep parallelism bounded, show per-URL start/finish updates during the run, and preserve the final summary in the original input order.
 
 ## Natural-Language Triggers
 
@@ -59,6 +61,7 @@ Do not require the user to mention the skill name. The combination of a supporte
 - Playlist handling: download only the requested item unless the user explicitly asks for a playlist
 - Batch behavior: accept multiple URLs directly or extract multiple URLs from a pasted text block
 - Restricted-source behavior: if a supported platform only exposes an audio stream and no video stream, treat the download as failed; this is especially common with TikTok Shop or other protected commerce/media pages
+- TikTok resolver behavior: for a known TikTok Shop/promoted URL, use `--tiktok-shop` to submit it to HTTP resolver providers first; for other TikTok links, do so only after the local path fails or returns unusable media
 - Retry behavior: use extractor, file, and fragment retries plus concurrent fragment downloads to improve resilience and speed on unstable HLS/media endpoints
 - Result behavior: summarize outcomes with stable status labels such as direct success, HLS fallback success, auth-needed failure, network instability, or restricted audio-only failure
 - Cache behavior: reuse previously downloaded successful outputs only when the cached file still exists and still contains both video and audio
@@ -121,6 +124,18 @@ Use cookies from Chrome for sites that need login state:
 python3 "${CODEX_HOME:-$HOME/.codex}/skills/social-video-downloader/scripts/download_social_video.py" "<url>" --cookies-from-browser chrome
 ```
 
+Use resolver-first routing when the user identifies a TikTok Shop or promoted video:
+
+```bash
+python3 "${CODEX_HOME:-$HOME/.codex}/skills/social-video-downloader/scripts/download_social_video.py" "<tiktok-url>" --tiktok-shop
+```
+
+Disable submission to third-party TikTok resolver providers when requested:
+
+```bash
+python3 "${CODEX_HOME:-$HOME/.codex}/skills/social-video-downloader/scripts/download_social_video.py" "<tiktok-url>" --no-tiktok-resolver
+```
+
 Choose a different folder only when the user asks:
 
 ```bash
@@ -141,7 +156,8 @@ python3 "${CODEX_HOME:-$HOME/.codex}/skills/social-video-downloader/scripts/down
 - The script records lightweight local run metrics under `~/.codex/skills/social-video-downloader/metrics/` so you can inspect recent KPI trends with `--kpi-report`.
 - The default output is intentionally optimized for Mac playback and PowerPoint embedding, not archival purity.
 - The script now avoids wasting time on browsers that are not installed and avoids re-encoding files that are already PowerPoint-safe.
-- TikTok Shop or other commercial/restricted links may expose only audio to third-party tools. When that happens, treat the URL as restricted and tell the user the platform did not provide a usable video stream.
+- TikTok fallback providers are HTTP-only in this stage; no browser or headless-browser automation is required.
+- When `--tiktok-shop` is used, or a normal TikTok download fails to yield usable video and audio, the script may submit that TikTok URL to SnapTik and then SSSTik. Use `--no-tiktok-resolver` if the user does not want third-party submission.
 - If the user asks for only audio, this skill is not the right default. Use a separate audio-only flow.
 - If the user asks for the highest quality, pass `--max-height 1080` or run `yt-dlp` manually with an explicit quality request instead of changing the skill default.
 - If a download fails because the platform changed, inspect the `yt-dlp` error first and update the script rather than replacing the workflow.
