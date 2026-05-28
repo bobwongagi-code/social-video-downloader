@@ -62,10 +62,10 @@ def validate_skill_metadata() -> int:
     if meta.get("name") != frontmatter["name"]:
         return fail("SKILL.md name and _meta.json name do not match")
 
-    script_text = (REPO_ROOT / "scripts" / "download_social_video.py").read_text(encoding="utf-8")
+    script_text = (REPO_ROOT / "scripts" / "constants.py").read_text(encoding="utf-8")
     match = re.search(r'^__version__ = "([^"]+)"$', script_text, re.MULTILINE)
     if not match:
-        return fail("download_social_video.py is missing __version__")
+        return fail("constants.py is missing __version__")
 
     script_version = match.group(1)
     meta_version = meta.get("version")
