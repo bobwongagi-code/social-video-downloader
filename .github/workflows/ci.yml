@@ -40,6 +40,13 @@ jobs:
       - name: Validate repository metadata
         run: python3 scripts/validate_repo.py
 
+      - name: Verify installed skill runtime
+        run: |
+          python3 scripts/sync_skill_runtime.py --install --target-root "${RUNNER_TEMP}/codex-home"
+          python3 scripts/sync_skill_runtime.py --check --target-root "${RUNNER_TEMP}/codex-home"
+          python3 "${RUNNER_TEMP}/codex-home/skills/social-video-downloader/scripts/download_social_video.py" --version
+          bash "${RUNNER_TEMP}/codex-home/skills/social-video-downloader/scripts/compress_for_whatsapp.sh" --help
+
       - name: Check diff formatting
         run: git diff --check
 

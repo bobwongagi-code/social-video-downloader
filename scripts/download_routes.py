@@ -1,7 +1,6 @@
 """Download route adapters for social pages and direct media URLs."""
 from __future__ import annotations
 
-import argparse
 import os
 import selectors
 import subprocess
@@ -15,7 +14,7 @@ from urllib.parse import unquote, urlparse
 from constants import (
     DEFAULT_FORMAT,
     DEFAULT_MAX_HEIGHT,
-    DEFAULT_OUTPUT_DIR,
+    DownloadOptions,
     DownloadRoute,
     ErrorCode,
     MAX_CONCURRENT_FRAGMENTS,
@@ -30,13 +29,6 @@ from cache import hash_sensitive_text
 from file_ops import atomic_commit, non_conflicting_path
 from hls import download_hls_via_segments
 from net import download_file_via_curl, validate_remote_url
-
-
-def output_directory(args: argparse.Namespace, *, create: bool = True) -> Path:
-    output_dir = Path(os.path.expanduser(args.output_dir)).resolve()
-    if create:
-        output_dir.mkdir(parents=True, exist_ok=True)
-    return output_dir
 
 
 def is_absolute_path(text: str) -> bool:
@@ -94,26 +86,25 @@ def error_code_from_detail(detail: str) -> ErrorCode:
     return ErrorCode.OTHER_FAILURE
 
 
-def identity_scope(args: argparse.Namespace) -> str:
-    if getattr(args, "cookies_from_browser", None):
-        return f"browser:{args.cookies_from_browser}"
-    if getattr(args, "auto_cookies", False):
+def identity_scope(options: DownloadOptions) -> str:
+    if options.cookies_from_browser:
+        return f"browser:{options.cookies_from_browser}"
+    if options.auto_cookies:
         return "auto-browser-cookie"
     return "anonymous"
 
 
 def build_command(
     url: str,
-    args: argparse.Namespace,
+    options: DownloadOptions,
     yt_dlp: str,
     ffmpeg: str,
-    output_dir: Path,
     browser: str | None = None,
 ) -> list[str]:
-    format_selector = DEFAULT_FORMAT.format(max_height=args.max_height)
+    format_selector = DEFAULT_FORMAT.format(max_height=options.max_height)
     variant = hash_sensitive_text(
-        f"{url}\0{args.max_height}\0{args.ppt_compatible}\0"
-        f"{getattr(args, 'keep_metadata', False)}\0{identity_scope(args)}"
+        f"{url}\0{options.max_height}\0{options.ppt_compatible}\0"
+        f"{options.keep_metadata}\0{identity_scope(options)}"
     )[:8]
     cmd = [
         yt_dlp,
@@ -132,7 +123,7 @@ def build_command(
         "--socket-timeout",
         "30",
         "--paths",
-        str(output_dir),
+        str(options.output_dir),
         "--output",
         f"%(title).160B [%(id)s] [{variant}].%(ext)s",
         "--format",
@@ -150,13 +141,13 @@ def build_command(
         ffmpeg,
     ]
 
-    if getattr(args, "force", False):
+    if options.force:
         cmd.remove("--no-overwrites")
         cmd.extend(["--force-overwrites"])
-    if getattr(args, "keep_metadata", False):
+    if options.keep_metadata:
         cmd.append("--embed-metadata")
 
-    cookie_source = browser or args.cookies_from_browser
+    cookie_source = browser or options.cookies_from_browser
     if cookie_source:
         cmd.extend(["--cookies-from-browser", cookie_source])
 
@@ -211,14 +202,13 @@ def run_download(cmd: list[str]) -> subprocess.CompletedProcess[str]:
 
 def try_download_with_fallbacks(
     url: str,
-    args: argparse.Namespace,
+    options: DownloadOptions,
     yt_dlp: str,
     ffmpeg: str,
-    output_dir: Path,
-    cookie_browsers: list[str],
+    cookie_browsers: tuple[str, ...],
 ) -> RouteResult:
-    attempts: list[str | None] = [args.cookies_from_browser]
-    if args.cookies_from_browser is None and args.auto_cookies:
+    attempts: list[str | None] = [options.cookies_from_browser]
+    if options.cookies_from_browser is None and options.auto_cookies:
         attempts.extend(cookie_browsers)
 
     tried: set[str | None] = set()
@@ -227,7 +217,7 @@ def try_download_with_fallbacks(
         if browser in tried:
             continue
         tried.add(browser)
-        cmd = build_command(url, args, yt_dlp, ffmpeg, output_dir, browser)
+        cmd = build_command(url, options, yt_dlp, ffmpeg, browser)
         print("Running:", redact_text(" ".join(cmd)), file=sys.stderr)
         result = run_download(cmd)
         if result.returncode == 0:
@@ -247,7 +237,7 @@ def try_download_with_fallbacks(
         last_error = summarize_error(result)
         if browser is not None:
             continue
-        if not args.auto_cookies or not looks_like_auth_failure(last_error):
+        if not options.auto_cookies or not looks_like_auth_failure(last_error):
             break
 
     return RouteResult(
@@ -259,7 +249,7 @@ def try_download_with_fallbacks(
     )
 
 
-def direct_media_target(url: str, args: argparse.Namespace) -> Path:
+def direct_media_target(url: str, options: DownloadOptions) -> Path:
     parsed = urlparse(url)
     path = unquote(parsed.path)
     name = Path(path).name
@@ -281,23 +271,23 @@ def direct_media_target(url: str, args: argparse.Namespace) -> Path:
         ext = ".webm"
 
     suffix = hash_sensitive_text(url)[:8]
-    target = output_directory(args) / f"{sanitize_filename(name)}-{suffix}{ext}"
-    return non_conflicting_path(target, force=getattr(args, "force", False))
+    target = options.output_dir / f"{sanitize_filename(name)}-{suffix}{ext}"
+    return non_conflicting_path(target, force=options.force)
 
 
 def download_direct_media(
-    url: str, args: argparse.Namespace, ffmpeg: str
+    url: str, options: DownloadOptions, ffmpeg: str
 ) -> RouteResult:
     try:
         validate_remote_url(url)
-        destination = direct_media_target(url, args)
+        destination = direct_media_target(url, options)
         if ".m3u8" in urlparse(url).path.lower():
             return download_hls_via_segments(
                 url,
                 destination,
                 ffmpeg,
-                max_height=getattr(args, "max_height", DEFAULT_MAX_HEIGHT),
-                force=getattr(args, "force", False),
+                max_height=options.max_height or DEFAULT_MAX_HEIGHT,
+                force=options.force,
             )
 
         descriptor, temp_name = tempfile.mkstemp(
@@ -310,7 +300,7 @@ def download_direct_media(
         try:
             print(f"Running direct download: {redact_url(url)}", file=sys.stderr)
             download_file_via_curl(url, temp_destination, max_bytes=MAX_DOWNLOAD_BYTES)
-            atomic_commit(temp_destination, destination, force=getattr(args, "force", False))
+            atomic_commit(temp_destination, destination, force=options.force)
         finally:
             temp_destination.unlink(missing_ok=True)
         return RouteResult(True, str(destination), DownloadRoute.DIRECT)

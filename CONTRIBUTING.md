@@ -32,8 +32,13 @@ python3 -m py_compile scripts/*.py tests/*.py
 python3 -m unittest discover -s tests -p 'test_*.py'
 python3 scripts/validate_repo.py
 bash -n scripts/compress_for_whatsapp.sh
+runtime_root="$(mktemp -d)"
+python3 scripts/sync_skill_runtime.py --install --target-root "$runtime_root"
+python3 scripts/sync_skill_runtime.py --check --target-root "$runtime_root"
 git diff --check
 ```
+
+The installed skill is a runtime copy, not a second source tree. After changing `SKILL.md`, `agents/openai.yaml`, or files under `scripts/`, refresh the local installation with `python3 scripts/sync_skill_runtime.py --install` and verify it with `python3 scripts/sync_skill_runtime.py --check`. The CI job performs the same install-and-check flow in a temporary Codex home.
 
 For manual stability checks against real long-running platform samples, see:
 

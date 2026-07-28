@@ -212,6 +212,14 @@ class ResourceBoundaryTests(unittest.TestCase):
             self.assertTrue(result.ok)
             self.assertEqual(budget.used, 10)
 
+    def test_budget_fails_fast_after_committed_usage_leaves_no_room(self) -> None:
+        budget = workflow_mod.BatchBudget(100)
+        self.assertTrue(budget.reserve(60))
+        budget.settle(60, 60)
+
+        self.assertFalse(budget.reserve(50))
+        self.assertEqual(budget.used, 60)
+
     def test_route_rejects_low_free_space_before_factory_runs(self) -> None:
         factory = unittest.mock.Mock()
         with tempfile.TemporaryDirectory() as tmp_dir, unittest.mock.patch.object(
@@ -242,20 +250,17 @@ class CliContractTests(unittest.TestCase):
         self.assertFalse(args.tiktok_resolver)
 
     def test_build_command_does_not_embed_metadata_or_force_overwrite_by_default(self) -> None:
-        args = SimpleNamespace(
+        options = constants.DownloadOptions(
+            output_dir=Path("/tmp/output"),
             max_height=720,
             ppt_compatible=True,
-            cookies_from_browser=None,
-            force=False,
-            keep_metadata=False,
         )
         with unittest.mock.patch.object(routes_mod, "hash_sensitive_text", return_value="deadbeef"):
             command = main_mod.build_command(
                 "https://example.com/video",
-                args,
+                options,
                 "yt-dlp",
                 "ffmpeg",
-                Path("/tmp/output"),
             )
         self.assertIn("--no-overwrites", command)
         self.assertNotIn("--embed-metadata", command)
@@ -330,12 +335,12 @@ class TikTokResolverParsingTests(unittest.TestCase):
 
 
 class TikTokResolverRoutingTests(unittest.TestCase):
-    def make_args(
+    def make_options(
         self, output_dir: str, *, tiktok_shop: bool = False, tiktok_resolver: bool = True
-    ) -> SimpleNamespace:
-        return SimpleNamespace(
+    ) -> constants.DownloadOptions:
+        return constants.DownloadOptions(
             dry_run=False,
-            output_dir=output_dir,
+            output_dir=Path(output_dir),
             tiktok_shop=tiktok_shop,
             tiktok_resolver=tiktok_resolver,
             ppt_compatible=False,
@@ -362,11 +367,8 @@ class TikTokResolverRoutingTests(unittest.TestCase):
             ):
                 result = main_mod.process_url(
                     "https://www.tiktok.com/@shop/video/123456",
-                    self.make_args(tmp_dir, tiktok_shop=True),
-                    "yt-dlp",
-                    "ffmpeg",
-                    Path(tmp_dir),
-                    [],
+                    self.make_options(tmp_dir, tiktok_shop=True),
+                    workflow_mod.DownloadServices("yt-dlp", "ffmpeg"),
                     None,
                 )
 
@@ -405,11 +407,8 @@ class TikTokResolverRoutingTests(unittest.TestCase):
             ):
                 result = main_mod.process_url(
                     "https://www.tiktok.com/@shop/video/123456",
-                    self.make_args(tmp_dir),
-                    "yt-dlp",
-                    "ffmpeg",
-                    Path(tmp_dir),
-                    [],
+                    self.make_options(tmp_dir),
+                    workflow_mod.DownloadServices("yt-dlp", "ffmpeg"),
                     None,
                 )
 
@@ -434,11 +433,8 @@ class TikTokResolverRoutingTests(unittest.TestCase):
             ):
                 result = main_mod.process_url(
                     "https://www.tiktok.com/@shop/video/123456",
-                    self.make_args(tmp_dir, tiktok_shop=True, tiktok_resolver=False),
-                    "yt-dlp",
-                    "ffmpeg",
-                    Path(tmp_dir),
-                    [],
+                    self.make_options(tmp_dir, tiktok_shop=True, tiktok_resolver=False),
+                    workflow_mod.DownloadServices("yt-dlp", "ffmpeg"),
                     None,
                 )
 
@@ -456,11 +452,8 @@ class TikTokResolverRoutingTests(unittest.TestCase):
             ), unittest.mock.patch.object(workflow_mod, "download_tiktok_via_resolvers") as mock_resolver:
                 result = main_mod.process_url(
                     "https://not-tiktok.com/@shop/video/123456",
-                    self.make_args(tmp_dir, tiktok_shop=True),
-                    "yt-dlp",
-                    "ffmpeg",
-                    Path(tmp_dir),
-                    [],
+                    self.make_options(tmp_dir, tiktok_shop=True),
+                    workflow_mod.DownloadServices("yt-dlp", "ffmpeg"),
                     None,
                 )
 
@@ -469,7 +462,7 @@ class TikTokResolverRoutingTests(unittest.TestCase):
 
     def test_resolver_rejects_media_without_audio(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
-            args = self.make_args(tmp_dir)
+            options = self.make_options(tmp_dir)
 
             def write_candidate(_url: str, destination: Path) -> None:
                 destination.touch()
@@ -488,7 +481,7 @@ class TikTokResolverRoutingTests(unittest.TestCase):
                 return_value={"has_video": True, "has_audio": False},
             ):
                 result = tiktok_resolver.download_tiktok_via_resolvers(
-                    "https://www.tiktok.com/@shop/video/123456", args, "ffmpeg"
+                    "https://www.tiktok.com/@shop/video/123456", options, "ffmpeg"
                 )
 
         self.assertFalse(result.ok)

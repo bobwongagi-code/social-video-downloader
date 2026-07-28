@@ -86,6 +86,22 @@ class ErrorCode(str, Enum):
 
 
 @dataclass(frozen=True)
+class DownloadOptions:
+    """Validated download policy passed below the CLI boundary."""
+
+    output_dir: Path
+    max_height: int = DEFAULT_MAX_HEIGHT
+    cookies_from_browser: str | None = None
+    auto_cookies: bool = False
+    ppt_compatible: bool = True
+    tiktok_resolver: bool = False
+    tiktok_shop: bool = False
+    force: bool = False
+    keep_metadata: bool = False
+    dry_run: bool = False
+
+
+@dataclass(frozen=True)
 class RouteResult:
     ok: bool
     path: str | None

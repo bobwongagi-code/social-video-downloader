@@ -122,6 +122,15 @@ bash scripts/compress_for_whatsapp.sh "/path/to/input.mp4" "/path/to/output.mp4"
 
 The helper keeps the original file, chooses a practical resolution from the available bitrate, and verifies that the result is within the requested MiB limit with H.264 video and AAC audio when audio exists.
 
+Check or refresh the installed Codex skill runtime:
+
+```bash
+python3 scripts/sync_skill_runtime.py --check
+python3 scripts/sync_skill_runtime.py --install
+```
+
+The default target is `${CODEX_HOME:-$HOME/.codex}`. Use `--target-root` to check a temporary or CI installation.
+
 Download a known TikTok Shop or promoted video without waiting for the ordinary TikTok extraction path:
 
 ```bash
@@ -175,14 +184,24 @@ social-video-downloader/
 ├── agents/
 │   └── openai.yaml
 └── scripts/
+    ├── cache.py
     ├── compress_for_whatsapp.sh
+    ├── constants.py
+    ├── deps.py
     ├── download_routes.py
     ├── download_social_video.py
     ├── download_workflow.py
+    ├── file_ops.py
     ├── hls.py
+    ├── kpi.py
     ├── media_probe.py
-    └── net.py
+    ├── net.py
+    ├── sync_skill_runtime.py
+    ├── tiktok_resolver.py
+    └── urls.py
 ```
+
+`validate_repo.py` is the repository metadata check; it is also included in the installed runtime manifest for consistent validation.
 
 Local runtime artifacts are intentionally ignored:
 

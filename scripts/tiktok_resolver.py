@@ -1,7 +1,6 @@
 """TikTok video download via HTTP resolver providers (SnapTik, SSSTik)."""
 from __future__ import annotations
 
-import argparse
 import html
 import os
 import re
@@ -12,8 +11,8 @@ from pathlib import Path
 from constants import (
     DownloadRoute,
     ErrorCode,
+    DownloadOptions,
     RouteResult,
-    SAFE_FILENAME_PATTERN,
     SNAPTIK_HOME_URL,
     SNAPTIK_SUBMIT_URL,
     SSSTIK_HOME_URL,
@@ -26,10 +25,6 @@ from file_ops import atomic_commit, non_conflicting_path
 from media_probe import media_facts, probe_media
 from net import curl_text_request, download_file_via_curl
 from urls import tiktok_video_id
-
-
-def _output_directory(args: argparse.Namespace) -> Path:
-    return Path(os.path.expanduser(args.output_dir)).resolve()
 
 
 def decode_snaptik_response(script: str) -> str:
@@ -114,15 +109,15 @@ def ssstik_candidates(url: str) -> tuple[list[str], str | None]:
     return media_url_candidates(response), title
 
 
-def resolver_target(url: str, title: str | None, args: argparse.Namespace) -> Path:
+def resolver_target(url: str, title: str | None, options: DownloadOptions) -> Path:
     identifier = tiktok_video_id(url) or hash_sensitive_text(url)[:8]
     filename = sanitize_filename(title or "tiktok-resolved-video")
-    target = _output_directory(args) / f"{filename} [{identifier}].mp4"
-    return non_conflicting_path(target, force=getattr(args, "force", False))
+    target = options.output_dir / f"{filename} [{identifier}].mp4"
+    return non_conflicting_path(target, force=options.force)
 
 
 def download_tiktok_via_resolvers(
-    url: str, args: argparse.Namespace, ffmpeg: str
+    url: str, options: DownloadOptions, ffmpeg: str
 ) -> RouteResult:
     provider_errors: list[str] = []
     providers = [("snaptik", snaptik_candidates), ("ssstik", ssstik_candidates)]
@@ -137,7 +132,7 @@ def download_tiktok_via_resolvers(
             if not candidates:
                 provider_errors.append(f"{provider_name}: no video URL returned")
                 continue
-            destination = resolver_target(url, title, args)
+            destination = resolver_target(url, title, options)
             for candidate in candidates:
                 descriptor, temp_name = tempfile.mkstemp(
                     prefix=f".{destination.stem}.resolver-",
@@ -161,7 +156,7 @@ def download_tiktok_via_resolvers(
                     atomic_commit(
                         temp_destination,
                         destination,
-                        force=getattr(args, "force", False),
+                        force=options.force,
                     )
                     return RouteResult(
                         True,

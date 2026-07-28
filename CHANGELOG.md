@@ -9,6 +9,8 @@ This changelog starts from the current public-repository baseline.
 ### Changed
 
 - Split the downloader entrypoint into route adapters and workflow orchestration without changing the CLI contract
+- Added typed download options/services at the CLI boundary and made batch-budget exhaustion fail fast instead of waiting forever after completed downloads
+- Added a source-to-installed-runtime synchronization tool and CI verification to prevent skill drift
 
 ## [0.5.0] - 2026-07-28
 

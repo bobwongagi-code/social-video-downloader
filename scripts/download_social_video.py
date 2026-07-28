@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import os
 import sys
 import uuid
 from datetime import datetime, timezone
@@ -13,6 +14,7 @@ from constants import (
     CACHE_TTL,
     DEFAULT_MAX_HEIGHT,
     DEFAULT_OUTPUT_DIR,
+    DownloadOptions,
     DownloadResult,
     DownloadRoute,
     ErrorCode,
@@ -42,12 +44,12 @@ from download_routes import (
     identity_scope,
     is_absolute_path,
     looks_like_auth_failure,
-    output_directory,
     run_download,
     try_download_with_fallbacks,
 )
 from download_workflow import (
     BatchBudget,
+    DownloadServices,
     _error_code_for_attempt,
     _failure_result,
     _run_bounded_route,
@@ -190,6 +192,28 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+def output_directory(args: argparse.Namespace, *, create: bool = True) -> Path:
+    output_dir = Path(os.path.expanduser(args.output_dir)).resolve()
+    if create:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir
+
+
+def options_for_args(args: argparse.Namespace, output_dir: Path) -> DownloadOptions:
+    return DownloadOptions(
+        output_dir=output_dir,
+        max_height=args.max_height,
+        cookies_from_browser=getattr(args, "cookies_from_browser", None),
+        auto_cookies=getattr(args, "auto_cookies", False),
+        ppt_compatible=getattr(args, "ppt_compatible", True),
+        tiktok_resolver=bool(getattr(args, "tiktok_resolver", False)),
+        tiktok_shop=getattr(args, "tiktok_shop", False),
+        force=getattr(args, "force", False),
+        keep_metadata=getattr(args, "keep_metadata", False),
+        dry_run=getattr(args, "dry_run", False),
+    )
+
+
 def print_summary(results: list[DownloadResult]) -> None:
     groups: dict[str, list[DownloadResult]] = {
         "Succeeded": [],
@@ -243,16 +267,17 @@ def print_summary(results: list[DownloadResult]) -> None:
 
 
 def cache_key_for(url: str, args: argparse.Namespace, output_dir: Path) -> str:
+    options = options_for_args(args, output_dir)
     payload = {
         "url": url,
-        "output_dir": str(output_dir),
-        "max_height": args.max_height,
-        "ppt_conversion": args.ppt_compatible,
-        "keep_metadata": getattr(args, "keep_metadata", False),
-        "identity_scope": identity_scope(args),
+        "output_dir": str(options.output_dir),
+        "max_height": options.max_height,
+        "ppt_conversion": options.ppt_compatible,
+        "keep_metadata": options.keep_metadata,
+        "identity_scope": identity_scope(options),
         "route": "direct" if is_direct_media_url(url) else classify_platform(url),
-        "tiktok_shop": args.tiktok_shop,
-        "tiktok_resolver": bool(getattr(args, "tiktok_resolver", False)),
+        "tiktok_shop": options.tiktok_shop,
+        "tiktok_resolver": options.tiktok_resolver,
         "tool_version": __version__,
     }
     return make_cache_key(payload)
@@ -271,6 +296,7 @@ def main() -> int:
 
         urls = normalize_urls(collect_urls(args))
         out_dir = output_directory(args, create=not args.dry_run)
+        options = options_for_args(args, out_dir)
 
         # A dry run must not install dependencies, create directories, touch the
         # cache salt, clean stale cache entries, or append KPI events.
@@ -279,13 +305,14 @@ def main() -> int:
             total = len(urls)
             for index, url in enumerate(urls, start=1):
                 print(f"[{index}/{total}] Planning: {redact_url(url)}", file=sys.stderr)
-                result = process_url(url, args, "", "", out_dir, [], None)
+                result = process_url(url, options, DownloadServices("", ""), None)
                 results.append(result)
             print_summary(results)
             return 0
 
         yt_dlp, ffmpeg = ensure_dependencies(args.install_missing)
         cookie_browsers = available_cookie_browsers() if args.auto_cookies else []
+        services = DownloadServices(yt_dlp, ffmpeg, tuple(cookie_browsers))
         cache = load_cache()
         results: list[DownloadResult] = []
         metrics_events: list[dict[str, object]] = []
@@ -300,11 +327,8 @@ def main() -> int:
             print(f"[{index}/{total}] Starting: {redact_url(url)}", file=sys.stderr)
             result = process_url(
                 url,
-                args,
-                yt_dlp,
-                ffmpeg,
-                out_dir,
-                cookie_browsers,
+                options,
+                services,
                 cache.get(cache_key_for(url, args, out_dir)),
                 batch_budget=batch_budget,
             )
