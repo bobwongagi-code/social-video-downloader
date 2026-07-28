@@ -29,7 +29,9 @@ Run these before opening a pull request:
 
 ```bash
 python3 -m py_compile scripts/download_social_video.py
+python3 -m unittest discover -s tests -p 'test_*.py'
 python3 scripts/validate_repo.py
+bash -n scripts/compress_for_whatsapp.sh
 git diff --check
 ```
 

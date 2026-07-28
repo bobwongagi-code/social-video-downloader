@@ -1,11 +1,17 @@
 ---
 name: social-video-downloader
-description: Download TikTok videos, Instagram reels/posts, Facebook videos, X/Twitter videos, YouTube videos, and YouTube Shorts to the local Downloads folder with balanced quality rather than maximum bitrate or resolution. Use when a user provides one or more social video URLs and wants the media saved locally with audio included, practical file sizes, reliable defaults for repeated downloading work, and final files that are compatible with QuickTime Player and PowerPoint. Trigger this skill for natural-language requests such as "下载这个视频", "帮我下载这个链接", "download this video", "save this reel", or similar requests that include a supported social-media URL.
+description: Download social videos and compress local videos to practical WhatsApp-ready MP4 files. Use when a user provides a supported social-media URL to download, or a local video path and asks to compress it to a target size for WhatsApp or file sharing. Outputs include audio when available and use H.264 + AAC for QuickTime, PowerPoint, and WhatsApp compatibility.
 ---
 
-# Social Video Downloader
+# Social Video Media
 
-Use this skill when the user gives a TikTok, Instagram, Facebook, X/Twitter, or YouTube URL and wants the video downloaded locally.
+Use this skill for two video operations: download a video from a supported social URL, or compress a local video for WhatsApp/file sharing.
+
+When the user gives a local video path and asks to compress it to a target size, use the bundled WhatsApp compression helper:
+
+```bash
+bash "${CODEX_HOME:-$HOME/.codex}/skills/social-video-downloader/scripts/compress_for_whatsapp.sh" "<input>" "<output>" "<target-mib>"
+```
 
 Prefer the bundled script so the behavior stays consistent:
 
@@ -13,7 +19,14 @@ Prefer the bundled script so the behavior stays consistent:
 python3 "${CODEX_HOME:-$HOME/.codex}/skills/social-video-downloader/scripts/download_social_video.py" "<url>"
 ```
 
-## Workflow
+## Route Selection
+
+- If the input contains a supported social URL and the user asks to download or save it, use `download_social_video.py`.
+- If the input is a local video path and the user asks to compress it, make it WhatsApp-ready, or fit a target size, use `compress_for_whatsapp.sh`.
+- If the user explicitly asks to download and then compress, run the two routes in that order and report both outputs.
+- Do not send a local file path to the URL downloader or send a social URL to the local compression helper.
+
+## Download Workflow
 
 1. Accept one or more URLs from TikTok, Instagram, Facebook, X/Twitter, YouTube, or YouTube Shorts.
 2. Save output to `~/Downloads` unless the user explicitly asks for another directory.
@@ -33,9 +46,17 @@ python3 "${CODEX_HOME:-$HOME/.codex}/skills/social-video-downloader/scripts/down
 16. Treat resolver results as untrusted until the final file passes both video-stream and audio-stream validation; never report an audio-only result as success.
 17. For multi-URL work, keep parallelism bounded, show per-URL start/finish updates during the run, and preserve the final summary in the original input order.
 
+## Local Compression Workflow
+
+1. Use the compression helper for local files, not the social URL downloader.
+2. Preserve the original input file. The helper writes a new MP4 and refuses to overwrite an existing output unless `--force` is explicitly supplied.
+3. Use the requested target size as a hard upper bound. The default `0.90` safety factor reserves room for MP4 overhead while two-pass encoding allocates the remaining budget between video and audio.
+4. Keep H.264 High Profile, AAC audio when the source has audio, `yuv420p`, and `faststart` so the result works well when sent as a WhatsApp Document/File.
+5. Verify the final file with `ffprobe` and report its path, size, duration, and streams. If the target forces an extremely low video bitrate, report the quality risk instead of presenting the result as lossless.
+
 ## Natural-Language Triggers
 
-Trigger this skill when the user includes a supported URL and asks in natural language to download or save the video.
+Trigger this skill when the user asks to download/save a supported social URL or asks to compress a local video for WhatsApp/file sharing.
 
 Common examples:
 
@@ -45,12 +66,15 @@ Common examples:
 - `save this youtube short https://...`
 - `把这个 x 视频下载下来 https://...`
 - `download the facebook video from this link https://...`
+- `把 /path/to/video.mp4 压缩到 64M 发 WhatsApp`
+- `compress this local video to 20MB for WhatsApp`
 
-Do not require the user to mention the skill name. The combination of a supported social-media URL and an obvious download intent is enough.
+Do not require the user to mention the skill name. A supported social-media URL plus download intent, or a local video path plus compression intent, is enough.
 
 ## Defaults
 
 - Output directory: `~/Downloads`
+- Local compression output: same directory as the input unless the user supplies an explicit output path
 - Quality target: cap height at `720`
 - Container preference: MP4 when remuxing, merging, or finalizing the file
 - Audio requirement: always prefer formats with audio; do not accept silent video unless the source itself has no audio track
@@ -67,12 +91,15 @@ Do not require the user to mention the skill name. The combination of a supporte
 - Cache behavior: reuse previously downloaded successful outputs only when the cached file still exists and still contains both video and audio
 - Batch UX behavior: print progress as each URL starts or finishes, and group the final summary by success, cache hit, auth issues, network instability, restricted source, and invalid input
 - KPI behavior: record lightweight per-run metrics locally and expose a CLI report so the downloader can be tuned against delivery, speed, cache-hit, and fallback-recovery goals; `--dry-run` events are logged but excluded from KPI scoring
+- Local compression behavior: use `scripts/compress_for_whatsapp.sh`; it requires `ffmpeg`, `ffprobe`, and `python3`, uses exact-duration bitrate budgeting, and validates the final H.264/AAC streams before reporting success
 
 ## Dependency Handling
 
-Run the script first. It checks for `yt-dlp` and `ffmpeg`.
+For the URL route, run the downloader first. It checks for `yt-dlp` and `ffmpeg`.
 
-If either tool is missing, let the script auto-install them through Homebrew by keeping the default `--install-missing` behavior. If Homebrew is unavailable or the user does not want automatic installs, stop and tell the user which dependency is missing.
+If either downloader dependency is missing, let the downloader auto-install it through Homebrew by keeping the default `--install-missing` behavior. If Homebrew is unavailable or the user does not want automatic installs, stop and tell the user which dependency is missing.
+
+The local compression helper does not install dependencies automatically. Check for `ffmpeg`, `ffprobe`, and `python3` first; ask before making system-level dependency changes.
 
 ## Commands
 
@@ -148,6 +175,24 @@ Disable the compatibility transcode only when the user explicitly wants the raw 
 python3 "${CODEX_HOME:-$HOME/.codex}/skills/social-video-downloader/scripts/download_social_video.py" "<url>" --no-ppt-compatible
 ```
 
+Compress a local video for WhatsApp:
+
+```bash
+bash "${CODEX_HOME:-$HOME/.codex}/skills/social-video-downloader/scripts/compress_for_whatsapp.sh" \
+  "/path/to/input.mp4" \
+  "/path/to/output [whatsapp].mp4" \
+  64
+```
+
+Use `--force` only when replacing an existing output is intentional:
+
+```bash
+bash "${CODEX_HOME:-$HOME/.codex}/skills/social-video-downloader/scripts/compress_for_whatsapp.sh" \
+  "/path/to/input.mp4" \
+  "/path/to/output.mp4" \
+  64 0.90 slow --force
+```
+
 ## Notes
 
 - Instagram, Facebook, X/Twitter, and some TikTok links can require logged-in cookies, depending on region and platform changes.
@@ -161,7 +206,8 @@ python3 "${CODEX_HOME:-$HOME/.codex}/skills/social-video-downloader/scripts/down
 - If the user asks for only audio, this skill is not the right default. Use a separate audio-only flow.
 - If the user asks for the highest quality, pass `--max-height 1080` or run `yt-dlp` manually with an explicit quality request instead of changing the skill default.
 - If a download fails because the platform changed, inspect the `yt-dlp` error first and update the script rather than replacing the workflow.
+- For WhatsApp sharing, recommend sending the result as a Document/File when preserving the encoded quality matters; ordinary gallery/video sending may apply another platform transcode.
 
 ## Resource
 
-Use [download_social_video.py](./scripts/download_social_video.py) for all normal work.
+Use [download_social_video.py](./scripts/download_social_video.py) for social downloads and [compress_for_whatsapp.sh](./scripts/compress_for_whatsapp.sh) for local WhatsApp compression.

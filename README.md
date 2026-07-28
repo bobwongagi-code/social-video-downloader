@@ -1,11 +1,12 @@
-# Social Video Downloader
+# Social Video Media
 
-A practical social-media video downloader for everyday work: save videos to `~/Downloads` with audio included, balanced quality, and output that already works in QuickTime Player and PowerPoint.
+A practical video media tool with two routes: download social videos to `~/Downloads`, or compress local videos into WhatsApp-ready MP4 files.
 
 This repo contains both:
 
-- A Codex skill for natural-language download requests
+- A Codex skill for natural-language download and compression requests
 - A bundled Python downloader script built around `yt-dlp` and `ffmpeg`
+- A bundled WhatsApp compression helper for local video files
 
 Project docs:
 
@@ -23,7 +24,7 @@ Most video download setups break down in real work:
 - They produce files that play in IINA but fail in QuickTime or PowerPoint
 - They work on simple MP4 links but get flaky on social pages or HLS streams
 
-This project is designed around a different goal: stable, presentation-friendly downloads with sensible defaults.
+This project is designed around a different goal: stable, presentation-friendly downloads and sharing-ready compressed files with sensible defaults.
 
 ## Highlights
 
@@ -34,6 +35,7 @@ This project is designed around a different goal: stable, presentation-friendly 
 - Recovery built in: supports retries, cookie fallback, HLS stall detection, and segmented fallback
 - TikTok restricted-video recovery: can use HTTP resolver providers when normal extraction fails or exposes audio only
 - Repeated-work friendly: includes cache reuse and lightweight KPI logging
+- WhatsApp-ready local compression: uses two-pass bitrate budgeting and validates the final H.264/AAC file
 
 ## What It Supports
 
@@ -46,6 +48,7 @@ Typical supported sources include:
 - YouTube videos and Shorts
 - Xiaohongshu links
 - Direct media URLs such as `.mp4` and `.m3u8`
+- Local MP4/MOV/M4V/WebM files for WhatsApp compression
 
 Platform support ultimately depends on whether the current `yt-dlp` extractor can access the source.
 
@@ -60,14 +63,23 @@ Platform support ultimately depends on whether the current `yt-dlp` extractor ca
 - HLS: try fast `ffmpeg` capture first, then fall back to segmented recovery if needed
 - Cache: reuse a previously downloaded file only if it still exists and still contains both video and audio
 - TikTok resolver: normal TikTok links stay local-first; known Shop/promoted links can skip directly to resolver fallback
+- Local compression: preserve the source, target the requested size with a 0.90 safety margin, and write a new MP4
+
+## Choose A Route
+
+- Give a supported social URL when the goal is to download a video.
+- Give a local video path when the goal is to compress it for WhatsApp or a target file size.
+- Ask explicitly for both operations when the downloaded result should also be compressed.
 
 ## Requirements
 
 - Python 3.9+
-- `yt-dlp`
-- `ffmpeg`
+- `ffmpeg` and `ffprobe` (ffprobe is bundled with standard FFmpeg installs)
+- `yt-dlp` for the social URL download route
 
 On macOS, the script can auto-install missing `yt-dlp` and `ffmpeg` with Homebrew by default. On other platforms, install them manually before use.
+
+The local compression helper does not install dependencies automatically; it requires `python3`, `ffmpeg`, and `ffprobe`.
 
 ## Quick Start
 
@@ -102,6 +114,14 @@ Use a logged-in browser session when needed:
 python3 scripts/download_social_video.py "<url>" --cookies-from-browser chrome
 ```
 
+Compress a local video for WhatsApp:
+
+```bash
+bash scripts/compress_for_whatsapp.sh "/path/to/input.mp4" "/path/to/output.mp4" 64
+```
+
+The helper keeps the original file, chooses a practical resolution from the available bitrate, and verifies that the result is within the requested MiB limit with H.264 video and AAC audio when audio exists.
+
 Download a known TikTok Shop or promoted video without waiting for the ordinary TikTok extraction path:
 
 ```bash
@@ -121,6 +141,9 @@ python3 scripts/download_social_video.py "https://x.com/i/status/..." "https://w
 
 # 3. Review recent real-run KPI trends
 python3 scripts/download_social_video.py --kpi-report
+
+# 4. Compress a local video for WhatsApp
+bash scripts/compress_for_whatsapp.sh "/path/to/input.mp4" "/path/to/output.mp4" 64
 ```
 
 ## Common Flags
@@ -136,6 +159,8 @@ python3 scripts/download_social_video.py --kpi-report
 - `--kpi-report`: summarize recent real-run metrics
 - `--version`: print the script version
 
+The compression helper accepts `TARGET_MB`, `SAFETY`, `PRESET`, and optional `--force` as positional arguments. It requires `ffmpeg`, `ffprobe`, and `python3`.
+
 ## Repository Layout
 
 ```text
@@ -146,6 +171,7 @@ social-video-downloader/
 ├── agents/
 │   └── openai.yaml
 └── scripts/
+    ├── compress_for_whatsapp.sh
     └── download_social_video.py
 ```
 

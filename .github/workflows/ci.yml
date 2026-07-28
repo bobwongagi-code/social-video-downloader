@@ -25,6 +25,9 @@ jobs:
       - name: Compile Python files
         run: python3 -m py_compile scripts/constants.py scripts/deps.py scripts/cache.py scripts/urls.py scripts/net.py scripts/hls.py scripts/tiktok_resolver.py scripts/media_probe.py scripts/kpi.py scripts/download_social_video.py scripts/validate_repo.py tests/test_download_social_video.py
 
+      - name: Check shell scripts
+        run: bash -n scripts/compress_for_whatsapp.sh
+
       - name: Run unit tests
         run: python3 -m unittest discover -s tests -p 'test_*.py'
 

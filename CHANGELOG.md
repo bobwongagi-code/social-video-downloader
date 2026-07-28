@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 This changelog starts from the current public-repository baseline.
 
+## [Unreleased]
+
+### Added
+
+- WhatsApp compression helper for local videos with exact-duration bitrate budgeting, two-pass H.264 encoding, and final media validation
+
+### Changed
+
+- Clarified the skill as a dual-route video media workflow: social URL download and local WhatsApp compression
+
 ## [0.4.0] - 2026-05-26
 
 ### Added
