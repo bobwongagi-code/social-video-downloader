@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 This changelog starts from the current public-repository baseline.
 
+## [Unreleased]
+
+### Changed
+
+- Split the downloader entrypoint into route adapters and workflow orchestration without changing the CLI contract
+
 ## [0.5.0] - 2026-07-28
 
 ### Added

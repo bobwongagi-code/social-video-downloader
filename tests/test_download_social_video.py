@@ -20,6 +20,8 @@ import media_probe
 import net
 import tiktok_resolver
 import urls
+import download_routes as routes_mod
+import download_workflow as workflow_mod
 import download_social_video as main_mod
 
 
@@ -192,14 +194,16 @@ class ResourceBoundaryTests(unittest.TestCase):
     def test_route_reserves_before_download_and_settles_actual_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             output = Path(tmp_dir) / "video.mp4"
-            budget = main_mod.BatchBudget(constants.MAX_DOWNLOAD_BYTES * 2)
+            budget = workflow_mod.BatchBudget(constants.MAX_DOWNLOAD_BYTES * 2)
 
             def route() -> constants.RouteResult:
                 output.write_bytes(b"x" * 10)
                 return constants.RouteResult(True, str(output), constants.DownloadRoute.DIRECT)
 
-            with unittest.mock.patch.object(main_mod, "free_bytes", return_value=constants.MIN_FREE_DISK_BYTES):
-                result = main_mod._run_bounded_route(
+            with unittest.mock.patch.object(
+                workflow_mod, "free_bytes", return_value=constants.MIN_FREE_DISK_BYTES
+            ):
+                result = workflow_mod._run_bounded_route(
                     route,
                     constants.DownloadRoute.DIRECT,
                     Path(tmp_dir),
@@ -211,9 +215,9 @@ class ResourceBoundaryTests(unittest.TestCase):
     def test_route_rejects_low_free_space_before_factory_runs(self) -> None:
         factory = unittest.mock.Mock()
         with tempfile.TemporaryDirectory() as tmp_dir, unittest.mock.patch.object(
-            main_mod, "free_bytes", return_value=0
+            workflow_mod, "free_bytes", return_value=0
         ):
-            result = main_mod._run_bounded_route(
+            result = workflow_mod._run_bounded_route(
                 factory,
                 constants.DownloadRoute.DIRECT,
                 Path(tmp_dir),
@@ -245,7 +249,7 @@ class CliContractTests(unittest.TestCase):
             force=False,
             keep_metadata=False,
         )
-        with unittest.mock.patch.object(main_mod, "hash_sensitive_text", return_value="deadbeef"):
+        with unittest.mock.patch.object(routes_mod, "hash_sensitive_text", return_value="deadbeef"):
             command = main_mod.build_command(
                 "https://example.com/video",
                 args,
@@ -341,7 +345,7 @@ class TikTokResolverRoutingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             saved_path = str(Path(tmp_dir) / "resolved.mp4")
             with unittest.mock.patch.object(
-                main_mod,
+                workflow_mod,
                 "download_tiktok_via_resolvers",
                 return_value=constants.RouteResult(
                     True,
@@ -350,9 +354,9 @@ class TikTokResolverRoutingTests(unittest.TestCase):
                     "snaptik",
                 ),
             ) as mock_resolver, unittest.mock.patch.object(
-                main_mod, "try_download_with_fallbacks"
+                workflow_mod, "try_download_with_fallbacks"
             ) as mock_ytdlp, unittest.mock.patch.object(
-                main_mod,
+                workflow_mod,
                 "media_facts",
                 return_value={"has_video": True, "has_audio": True},
             ):
@@ -378,11 +382,11 @@ class TikTokResolverRoutingTests(unittest.TestCase):
             audio_path.touch()
             resolved_path = str(Path(tmp_dir) / "resolved.mp4")
             with unittest.mock.patch.object(
-                main_mod,
+                workflow_mod,
                 "try_download_with_fallbacks",
                 return_value=(True, str(audio_path), "none"),
             ), unittest.mock.patch.object(
-                main_mod,
+                workflow_mod,
                 "download_tiktok_via_resolvers",
                 return_value=constants.RouteResult(
                     True,
@@ -391,7 +395,7 @@ class TikTokResolverRoutingTests(unittest.TestCase):
                     "snaptik",
                 ),
             ) as mock_resolver, unittest.mock.patch.object(
-                main_mod,
+                workflow_mod,
                 "media_facts",
                 side_effect=[
                     {"has_video": False, "has_audio": True},
@@ -418,13 +422,13 @@ class TikTokResolverRoutingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             saved_path = str(Path(tmp_dir) / "local.mp4")
             with unittest.mock.patch.object(
-                main_mod,
+                workflow_mod,
                 "try_download_with_fallbacks",
                 return_value=(True, saved_path, "none"),
             ) as mock_ytdlp, unittest.mock.patch.object(
-                main_mod, "download_tiktok_via_resolvers"
+                workflow_mod, "download_tiktok_via_resolvers"
             ) as mock_resolver, unittest.mock.patch.object(
-                main_mod,
+                workflow_mod,
                 "media_facts",
                 return_value={"has_video": True, "has_audio": True},
             ):
@@ -446,10 +450,10 @@ class TikTokResolverRoutingTests(unittest.TestCase):
     def test_lookalike_domain_never_uses_tiktok_resolver(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             with unittest.mock.patch.object(
-                main_mod,
+                workflow_mod,
                 "try_download_with_fallbacks",
                 return_value=(False, None, "extractor failed"),
-            ), unittest.mock.patch.object(main_mod, "download_tiktok_via_resolvers") as mock_resolver:
+            ), unittest.mock.patch.object(workflow_mod, "download_tiktok_via_resolvers") as mock_resolver:
                 result = main_mod.process_url(
                     "https://not-tiktok.com/@shop/video/123456",
                     self.make_args(tmp_dir, tiktok_shop=True),
