@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""Download social-media videos with balanced quality and PowerPoint compatibility."""
+"""Download social-media videos with balanced quality and a basic presentation profile."""
 from __future__ import annotations
 
 import argparse
 import concurrent.futures
-import hashlib
 import os
+import selectors
 import subprocess
 import sys
+import tempfile
+import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from pathlib import PureWindowsPath
@@ -19,28 +22,43 @@ from constants import (
     DEFAULT_FORMAT,
     DEFAULT_MAX_HEIGHT,
     DEFAULT_OUTPUT_DIR,
+    DownloadRoute,
+    MAX_CONCURRENT_FRAGMENTS,
+    MAX_BATCH_BYTES,
+    MAX_DOWNLOAD_BYTES,
+    MAX_KPI_DAYS,
+    MAX_OUTPUT_HEIGHT,
+    MAX_URL_WORKERS,
+    MIN_FREE_DISK_BYTES,
+    ErrorCode,
+    RouteResult,
     URL_WORKERS,
     DownloadResult,
     __version__,
+    redact_text,
+    redact_url,
     sanitize_filename,
     summarize_error,
 )
 from cache import (
     append_metrics_events,
     cache_entry_is_fresh,
+    hash_sensitive_text,
     load_cache,
-    save_cache,
+    make_cache_key,
+    merge_cache_entries,
 )
 from deps import available_cookie_browsers, ensure_dependencies, which_or_none
-from hls import download_hls_via_segments, run_hls_fast_path_with_stall_detection
-from kpi import classify_error_category, render_kpi_report
+from file_ops import atomic_commit, free_bytes, non_conflicting_path
+from hls import download_hls_via_segments
+from kpi import render_kpi_report
 from media_probe import (
     cached_file_is_usable,
-    has_audio_stream,
-    has_video_stream,
     make_powerpoint_compatible,
     media_facts,
+    probe_media,
 )
+from net import download_file_via_curl, validate_remote_url
 from tiktok_resolver import download_tiktok_via_resolvers
 from urls import (
     classify_platform,
@@ -54,6 +72,16 @@ from urls import (
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
+
+def bounded_positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be positive")
+    return parsed
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -79,7 +107,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--max-height",
-        type=int,
+        type=bounded_positive_int,
         default=DEFAULT_MAX_HEIGHT,
         help="Upper bound for video height. Defaults to 720.",
     )
@@ -91,8 +119,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--auto-cookies",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Retry failed downloads with browser cookies automatically.",
+        default=False,
+        help="Opt in to retrying failed downloads with detected browser cookies.",
     )
     parser.add_argument(
         "--text-file",
@@ -101,18 +129,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--install-missing",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Automatically install missing yt-dlp/ffmpeg with Homebrew.",
+        default=False,
+        help="Opt in to installing missing yt-dlp/ffmpeg with Homebrew.",
     )
     parser.add_argument(
         "--ppt-compatible",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Convert each downloaded file to H.264 video + AAC audio for QuickTime and PowerPoint compatibility.",
+        help="Normalize each downloaded file to a basic H.264/AAC/MP4 profile for presentation workflows.",
     )
     parser.add_argument(
         "--concurrency",
-        type=int,
+        type=bounded_positive_int,
         default=URL_WORKERS,
         help="Number of parallel URL downloads. Defaults to 3.",
     )
@@ -124,8 +152,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--tiktok-resolver",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Use HTTP resolver providers when TikTok local extraction fails or returns no usable video.",
+        default=None,
+        help="Opt in to HTTP resolver providers for TikTok URLs.",
     )
     parser.add_argument(
         "--tiktok-shop",
@@ -133,16 +161,38 @@ def parse_args() -> argparse.Namespace:
         help="Treat TikTok inputs as known Shop/promoted videos and try HTTP resolver providers first.",
     )
     parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Replace an existing output only when explicitly requested.",
+    )
+    parser.add_argument(
+        "--keep-metadata",
+        action="store_true",
+        help="Keep extractor metadata in downloaded media when supported.",
+    )
+    parser.add_argument(
         "--kpi-report",
         nargs="?",
-        type=int,
+        type=bounded_positive_int,
         const=7,
         metavar="DAYS",
         help="Print a KPI summary for the last N days. Defaults to 7 when provided without a value.",
     )
     args = parser.parse_args()
-    if args.kpi_report is None and not args.inputs:
-        parser.error("at least one input URL or --kpi-report is required")
+    if args.max_height > MAX_OUTPUT_HEIGHT:
+        parser.error(f"--max-height must be <= {MAX_OUTPUT_HEIGHT}")
+    if args.concurrency > MAX_URL_WORKERS:
+        parser.error(f"--concurrency must be <= {MAX_URL_WORKERS}")
+    if args.kpi_report is not None:
+        if args.kpi_report > MAX_KPI_DAYS:
+            parser.error(f"KPI DAYS must be <= {MAX_KPI_DAYS}")
+        if args.inputs or args.text_file:
+            parser.error("--kpi-report cannot be combined with URL inputs")
+        return args
+    if not args.inputs and not args.text_file:
+        parser.error("at least one input URL or --text-file is required")
+    if args.tiktok_resolver is None:
+        args.tiktok_resolver = bool(args.tiktok_shop)
     return args
 
 
@@ -150,9 +200,10 @@ def parse_args() -> argparse.Namespace:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def output_directory(args: argparse.Namespace) -> Path:
+def output_directory(args: argparse.Namespace, *, create: bool = True) -> Path:
     output_dir = Path(os.path.expanduser(args.output_dir)).resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if create:
+        output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir
 
 
@@ -167,6 +218,12 @@ def extract_filepaths(stdout: str) -> list[str]:
         if is_absolute_path(line) and Path(line).suffix:
             paths.append(line)
     return paths
+
+
+def _bounded_tail(buffer: bytearray, data: bytes, limit: int = 64 * 1024) -> None:
+    buffer.extend(data)
+    if len(buffer) > limit:
+        del buffer[: len(buffer) - limit]
 
 
 def looks_like_auth_failure(stderr: str) -> bool:
@@ -185,6 +242,34 @@ def looks_like_auth_failure(stderr: str) -> bool:
     return any(marker in lowered for marker in markers)
 
 
+def error_code_from_detail(detail: str) -> ErrorCode:
+    lowered = detail.lower()
+    if any(token in lowered for token in ["login", "sign in", "private", "authentication"]):
+        return ErrorCode.AUTH_NEEDED
+    if any(
+        token in lowered
+        for token in [
+            "timed out",
+            "ssl",
+            "network",
+            "connection reset",
+            "temporarily unavailable",
+        ]
+    ):
+        return ErrorCode.NETWORK_UNSTABLE
+    if "no supported urls were found" in lowered:
+        return ErrorCode.INPUT_INVALID
+    return ErrorCode.OTHER_FAILURE
+
+
+def identity_scope(args: argparse.Namespace) -> str:
+    if getattr(args, "cookies_from_browser", None):
+        return f"browser:{args.cookies_from_browser}"
+    if getattr(args, "auto_cookies", False):
+        return "auto-browser-cookie"
+    return "anonymous"
+
+
 # ---------------------------------------------------------------------------
 # yt-dlp download path
 # ---------------------------------------------------------------------------
@@ -198,6 +283,10 @@ def build_command(
     browser: str | None = None,
 ) -> list[str]:
     format_selector = DEFAULT_FORMAT.format(max_height=args.max_height)
+    variant = hash_sensitive_text(
+        f"{url}\0{args.max_height}\0{args.ppt_compatible}\0"
+        f"{getattr(args, 'keep_metadata', False)}\0{identity_scope(args)}"
+    )[:8]
     cmd = [
         yt_dlp,
         "--no-playlist",
@@ -211,25 +300,33 @@ def build_command(
         "--retry-sleep",
         "fragment:2",
         "--concurrent-fragments",
-        "4",
+        str(MAX_CONCURRENT_FRAGMENTS),
         "--socket-timeout",
         "30",
         "--paths",
         str(output_dir),
         "--output",
-        "%(title).180B [%(id)s].%(ext)s",
+        f"%(title).160B [%(id)s] [{variant}].%(ext)s",
         "--format",
         format_selector,
         "--merge-output-format",
         "mp4",
         "--remux-video",
         "mp4",
-        "--embed-metadata",
+        "--max-filesize",
+        str(MAX_DOWNLOAD_BYTES),
+        "--no-overwrites",
         "--print",
         "after_move:%(filepath)s",
         "--ffmpeg-location",
         ffmpeg,
     ]
+
+    if getattr(args, "force", False):
+        cmd.remove("--no-overwrites")
+        cmd.extend(["--force-overwrites"])
+    if getattr(args, "keep_metadata", False):
+        cmd.append("--embed-metadata")
 
     cookie_source = browser or args.cookies_from_browser
     if cookie_source:
@@ -240,7 +337,44 @@ def build_command(
 
 
 def run_download(cmd: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    selector = selectors.DefaultSelector()
+    assert process.stdout is not None
+    assert process.stderr is not None
+    selector.register(process.stdout, selectors.EVENT_READ)
+    selector.register(process.stderr, selectors.EVENT_READ)
+    stdout_tail = bytearray()
+    stderr_tail = bytearray()
+    deadline = time.monotonic() + 1800
+    try:
+        while selector.get_map():
+            if time.monotonic() >= deadline:
+                process.kill()
+                process.wait(timeout=10)
+                return subprocess.CompletedProcess(
+                    cmd,
+                    -9,
+                    stdout_tail.decode("utf-8", errors="replace"),
+                    "yt-dlp timed out after 30 minutes\n" + stderr_tail.decode("utf-8", errors="replace"),
+                )
+            for key, _ in selector.select(timeout=0.5):
+                try:
+                    chunk = os.read(key.fileobj.fileno(), 8192)
+                except OSError:
+                    chunk = b""
+                if chunk:
+                    _bounded_tail(stdout_tail if key.fileobj is process.stdout else stderr_tail, chunk)
+                else:
+                    selector.unregister(key.fileobj)
+                    key.fileobj.close()
+        return subprocess.CompletedProcess(
+            cmd,
+            process.wait(),
+            stdout_tail.decode("utf-8", errors="replace"),
+            stderr_tail.decode("utf-8", errors="replace"),
+        )
+    finally:
+        selector.close()
 
 
 def try_download_with_fallbacks(
@@ -250,7 +384,7 @@ def try_download_with_fallbacks(
     ffmpeg: str,
     output_dir: Path,
     cookie_browsers: list[str],
-) -> tuple[bool, str | None, str]:
+) -> RouteResult:
     attempts: list[str | None] = [args.cookies_from_browser]
     if args.cookies_from_browser is None and args.auto_cookies:
         attempts.extend(cookie_browsers)
@@ -262,12 +396,17 @@ def try_download_with_fallbacks(
             continue
         tried.add(browser)
         cmd = build_command(url, args, yt_dlp, ffmpeg, output_dir, browser)
-        print("Running:", " ".join(cmd), file=sys.stderr)
+        print("Running:", redact_text(" ".join(cmd)), file=sys.stderr)
         result = run_download(cmd)
         if result.returncode == 0:
             filepaths = extract_filepaths(result.stdout)
             if filepaths:
-                return True, filepaths[-1], browser or "none"
+                return RouteResult(
+                    True,
+                    filepaths[-1],
+                    DownloadRoute.SOCIAL,
+                    browser=browser,
+                )
             last_error = "yt-dlp exited successfully but produced no output file path."
             if browser is not None:
                 continue
@@ -279,7 +418,13 @@ def try_download_with_fallbacks(
         if not args.auto_cookies or not looks_like_auth_failure(last_error):
             break
 
-    return False, None, last_error
+    return RouteResult(
+        False,
+        None,
+        DownloadRoute.SOCIAL,
+        last_error,
+        error_code=error_code_from_detail(last_error),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -307,85 +452,178 @@ def direct_media_target(url: str, args: argparse.Namespace) -> Path:
     if ".webm" in path.lower():
         ext = ".webm"
 
-    suffix = hashlib.sha1(url.encode("utf-8")).hexdigest()[:8]
-    return output_directory(args) / f"{sanitize_filename(name)}-{suffix}{ext}"
+    suffix = hash_sensitive_text(url)[:8]
+    target = output_directory(args) / f"{sanitize_filename(name)}-{suffix}{ext}"
+    return non_conflicting_path(target, force=getattr(args, "force", False))
 
 
 def download_direct_media(
     url: str, args: argparse.Namespace, ffmpeg: str
-) -> tuple[bool, str | None, str]:
-    destination = direct_media_target(url, args)
-    temp_destination = destination.with_name(f"{destination.stem} [download-tmp]{destination.suffix}")
+) -> RouteResult:
+    try:
+        validate_remote_url(url)
+        destination = direct_media_target(url, args)
+        if ".m3u8" in urlparse(url).path.lower():
+            return download_hls_via_segments(
+                url,
+                destination,
+                ffmpeg,
+                max_height=getattr(args, "max_height", DEFAULT_MAX_HEIGHT),
+                force=getattr(args, "force", False),
+            )
 
-    if ".m3u8" in urlparse(url).path.lower():
-        cmd = [
-            ffmpeg,
-            "-y",
-            "-protocol_whitelist",
-            "file,http,https,tcp,tls,crypto",
-            "-reconnect",
-            "1",
-            "-reconnect_streamed",
-            "1",
-            "-reconnect_on_network_error",
-            "1",
-            "-reconnect_delay_max",
-            "5",
-            "-i",
-            url,
-            "-map",
-            "0:v:0?",
-            "-map",
-            "0:a:0?",
-            "-dn",
-            "-c",
-            "copy",
-            "-bsf:a",
-            "aac_adtstoasc",
-            str(temp_destination),
-        ]
-    else:
-        curl = which_or_none("curl")
-        if curl is None:
-            return False, None, "curl is required for direct media URLs but is not available."
-        cmd = [
-            curl,
-            "-L",
-            "--fail",
-            "--retry",
-            "5",
-            "--retry-all-errors",
-            "--retry-delay",
-            "1",
-            "--silent",
-            "--show-error",
-            "-o",
-            str(temp_destination),
-            url,
-        ]
-
-    print("Running direct download:", " ".join(cmd), file=sys.stderr)
-    is_hls = ".m3u8" in urlparse(url).path.lower()
-    if is_hls:
-        ok, detail = run_hls_fast_path_with_stall_detection(cmd, temp_destination)
-        if not ok:
+        descriptor, temp_name = tempfile.mkstemp(
+            prefix=f".{destination.stem}.download-",
+            suffix=destination.suffix,
+            dir=destination.parent,
+        )
+        os.close(descriptor)
+        temp_destination = Path(temp_name)
+        try:
+            print(f"Running direct download: {redact_url(url)}", file=sys.stderr)
+            download_file_via_curl(url, temp_destination, max_bytes=MAX_DOWNLOAD_BYTES)
+            atomic_commit(temp_destination, destination, force=getattr(args, "force", False))
+        finally:
             temp_destination.unlink(missing_ok=True)
-            print(f"Direct HLS capture did not finish cleanly: {detail}", file=sys.stderr)
-            print("Trying segmented HLS fallback.", file=sys.stderr)
-            return download_hls_via_segments(url, destination, ffmpeg)
-    else:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
-        if result.returncode != 0:
-            temp_destination.unlink(missing_ok=True)
-            return False, None, summarize_error(result)
-
-    os.replace(temp_destination, destination)
-    return True, str(destination), "direct"
+        return RouteResult(True, str(destination), DownloadRoute.DIRECT)
+    except Exception as exc:
+        return RouteResult(
+            False,
+            None,
+            DownloadRoute.DIRECT,
+            redact_text(str(exc)),
+            error_code=ErrorCode.DIRECT_DOWNLOAD_FAILED,
+        )
 
 
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
+
+
+class BatchBudget:
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.used = 0
+        self._condition = threading.Condition()
+
+    def reserve(self, amount: int) -> bool:
+        if amount <= 0 or amount > self.limit:
+            return False
+        with self._condition:
+            while self.used + amount > self.limit:
+                self._condition.wait(timeout=1)
+            self.used += amount
+            return True
+
+    def settle(self, reservation: int, actual: int) -> None:
+        actual = max(0, min(actual, reservation))
+        with self._condition:
+            self.used = max(0, self.used - reservation) + actual
+            self._condition.notify_all()
+
+
+def _error_code_for_attempt(attempt: RouteResult) -> ErrorCode:
+    if attempt.error_code is not ErrorCode.NONE:
+        return attempt.error_code
+    if attempt.route is DownloadRoute.DIRECT:
+        return ErrorCode.DIRECT_DOWNLOAD_FAILED
+    if attempt.route is DownloadRoute.HLS_SEGMENTED:
+        return ErrorCode.HLS_DOWNLOAD_FAILED
+    if attempt.route is DownloadRoute.TIKTOK_RESOLVER:
+        return ErrorCode.TIKTOK_RESOLVER_FAILED
+    return error_code_from_detail(attempt.detail)
+
+
+def _failure_result(
+    url: str,
+    attempt: RouteResult,
+    error_code: ErrorCode,
+    message: str,
+    started_at: float,
+    *,
+    media_state: str = "no_media_stream",
+    attempt_number: int = 1,
+    transcoded: bool = False,
+    facts: dict[str, object] | None = None,
+) -> DownloadResult:
+    facts = facts or {}
+    metadata = {
+        "duration_ms": int((time.monotonic() - started_at) * 1000),
+        "from_cache": False,
+        "used_cookies": attempt.browser is not None,
+        "used_fallback": attempt.route in {DownloadRoute.HLS_SEGMENTED, DownloadRoute.TIKTOK_RESOLVER},
+        "transcoded": transcoded,
+        "error_code": error_code.value,
+        "media_state": media_state,
+        "attempt_number": attempt_number,
+        "has_video": bool(facts.get("has_video", False)),
+        "has_audio": bool(facts.get("has_audio", False)),
+        "basic_ppt_profile": bool(facts.get("basic_ppt_profile", False)),
+    }
+    return DownloadResult(url, False, message, None, attempt.route, error_code, metadata)
+
+
+def _run_bounded_route(
+    factory: object,
+    route: DownloadRoute,
+    output_dir: Path,
+    batch_budget: BatchBudget | None,
+) -> RouteResult:
+    try:
+        available = free_bytes(output_dir)
+    except OSError as exc:
+        return RouteResult(
+            False,
+            None,
+            route,
+            f"unable to inspect free disk space: {redact_text(str(exc))}",
+            error_code=ErrorCode.RESOURCE_LIMIT,
+        )
+    if available < MIN_FREE_DISK_BYTES:
+        return RouteResult(
+            False,
+            None,
+            route,
+            f"less than {MIN_FREE_DISK_BYTES} bytes of free disk space remain",
+            error_code=ErrorCode.RESOURCE_LIMIT,
+        )
+
+    reservation = MAX_DOWNLOAD_BYTES if batch_budget is not None else 0
+    if reservation and not batch_budget.reserve(reservation):
+        return RouteResult(
+            False,
+            None,
+            route,
+            "batch budget is too small for one download",
+            error_code=ErrorCode.RESOURCE_LIMIT,
+        )
+    try:
+        attempt = factory()  # type: ignore[operator]
+        if not isinstance(attempt, RouteResult):
+            ok, path, detail = attempt
+            attempt = RouteResult(bool(ok), path, route, detail)
+        actual = 0
+        if attempt.ok and attempt.path:
+            candidate = Path(attempt.path)
+            if candidate.exists():
+                actual = candidate.stat().st_size
+                if actual > MAX_DOWNLOAD_BYTES:
+                    attempt = RouteResult(
+                        False,
+                        None,
+                        attempt.route,
+                        f"downloaded file exceeded {MAX_DOWNLOAD_BYTES} bytes",
+                        attempt.browser,
+                        ErrorCode.RESOURCE_LIMIT,
+                    )
+        if batch_budget is not None:
+            batch_budget.settle(reservation, actual if attempt.ok else 0)
+        return attempt
+    except BaseException:
+        if batch_budget is not None:
+            batch_budget.settle(reservation, 0)
+        raise
 
 def process_url(
     url: str,
@@ -394,182 +632,438 @@ def process_url(
     ffmpeg: str,
     output_dir: Path,
     cookie_browsers: list[str],
-    cached_entry: dict[str, str] | None,
+    cached_entry: dict[str, object] | None,
+    *,
+    batch_budget: BatchBudget | None = None,
 ) -> DownloadResult:
     started_at = time.monotonic()
     if cached_entry:
-        cached_path = cached_entry.get("path", "")
-        cached_status = cached_entry.get("status", "success_cached")
+        cached_path = str(cached_entry.get("path", ""))
         if cache_entry_is_fresh(cached_entry) and cached_file_is_usable(cached_path, ffmpeg):
-            duration_ms = int((time.monotonic() - started_at) * 1000)
             metadata = {
-                "duration_ms": duration_ms,
+                "duration_ms": int((time.monotonic() - started_at) * 1000),
                 "from_cache": True,
                 "used_cookies": False,
                 "used_fallback": False,
                 "transcoded": False,
-                "error_category": "none",
+                "error_code": ErrorCode.NONE.value,
+                "media_state": str(cached_entry.get("media_state", "audio_and_video")),
+                "attempt_number": 0,
+                "has_video": True,
+                "has_audio": bool(cached_entry.get("has_audio", True)),
+                "basic_ppt_profile": bool(cached_entry.get("basic_ppt_profile", False)),
+                "bytes": Path(cached_path).stat().st_size if Path(cached_path).exists() else 0,
             }
-            return DownloadResult(url, True, f"success_cached:{cached_status}: {cached_path}", cached_path, cached_status, metadata)
-        if args.dry_run:
-            duration_ms = int((time.monotonic() - started_at) * 1000)
-            metadata = {
-                "duration_ms": duration_ms,
-                "from_cache": False,
-                "used_cookies": False,
-                "used_fallback": False,
-                "transcoded": False,
-                "error_category": "none",
-            }
-            return DownloadResult(url, True, "dry_run: cache entry exists but is stale or the file is no longer usable", None, None, metadata)
+            return DownloadResult(
+                url,
+                True,
+                f"cached file: {cached_path}",
+                cached_path,
+                DownloadRoute.CACHE,
+                ErrorCode.NONE,
+                metadata,
+            )
 
     if args.dry_run:
-        duration_ms = int((time.monotonic() - started_at) * 1000)
         metadata = {
-            "duration_ms": duration_ms,
+            "duration_ms": int((time.monotonic() - started_at) * 1000),
             "from_cache": False,
             "used_cookies": False,
             "used_fallback": False,
             "transcoded": False,
-            "error_category": "none",
+            "error_code": ErrorCode.NONE.value,
+            "has_video": False,
+            "has_audio": False,
+            "basic_ppt_profile": False,
         }
         if is_direct_media_url(url):
-            return DownloadResult(url, True, "dry_run: direct_media -> will download directly", None, None, metadata)
-        if args.tiktok_shop and args.tiktok_resolver and is_tiktok_url(url):
-            return DownloadResult(url, True, "dry_run: tiktok_shop -> will use HTTP resolver providers first", None, None, metadata)
-        return DownloadResult(url, True, "dry_run: social_page -> will use yt-dlp flow", None, None, metadata)
+            message = "would download direct media"
+        elif args.tiktok_shop and getattr(args, "tiktok_resolver", False) and is_tiktok_url(url):
+            message = "would use HTTP resolver providers first"
+        else:
+            message = "would use yt-dlp social-page flow"
+        return DownloadResult(url, True, message, None, DownloadRoute.DRY_RUN, ErrorCode.NONE, metadata)
 
     tiktok_url = is_tiktok_url(url)
-    resolver_allowed = args.tiktok_resolver and tiktok_url
+    resolver_allowed = bool(getattr(args, "tiktok_resolver", False)) and tiktok_url
     resolver_first = args.tiktok_shop and resolver_allowed
-
     if resolver_first:
-        ok, detail, extra = download_tiktok_via_resolvers(url, args, ffmpeg)
+        attempt = _run_bounded_route(
+            lambda: download_tiktok_via_resolvers(url, args, ffmpeg),
+            DownloadRoute.TIKTOK_RESOLVER,
+            output_dir,
+            batch_budget,
+        )
     elif is_direct_media_url(url):
-        ok, detail, extra = download_direct_media(url, args, ffmpeg)
+        attempt = _run_bounded_route(
+            lambda: download_direct_media(url, args, ffmpeg),
+            DownloadRoute.DIRECT,
+            output_dir,
+            batch_budget,
+        )
     else:
-        ok, detail, extra = try_download_with_fallbacks(url, args, yt_dlp, ffmpeg, output_dir, cookie_browsers)
+        attempt = _run_bounded_route(
+            lambda: try_download_with_fallbacks(url, args, yt_dlp, ffmpeg, output_dir, cookie_browsers),
+            DownloadRoute.SOCIAL,
+            output_dir,
+            batch_budget,
+        )
 
-    if not ok and resolver_allowed and not resolver_first:
-        ok, detail, extra = download_tiktok_via_resolvers(url, args, ffmpeg)
+    attempt_number = 1
+    if not attempt.ok and resolver_allowed and not resolver_first:
+        attempt_number += 1
+        attempt = _run_bounded_route(
+            lambda: download_tiktok_via_resolvers(url, args, ffmpeg),
+            DownloadRoute.TIKTOK_RESOLVER,
+            output_dir,
+            batch_budget,
+        )
 
-    if ok and detail:
-        facts = media_facts(detail, ffmpeg)
-        rejection = ""
-        if not facts["has_video"]:
-            rejection = (
-                "restricted_audio_only: Downloaded media contained no video stream. "
-                "The platform currently exposed only audio for this URL; try a logged-in "
-                "browser session or a different extractor path."
-            )
-        elif not facts["has_audio"]:
-            rejection = (
-                "restricted_audio_only: Downloaded media contained no audio stream. "
-                "The source did not provide a usable video-with-audio result for this URL."
-            )
-        if rejection:
-            Path(detail).unlink(missing_ok=True)
-            if resolver_allowed and not extra.startswith("success_tiktok_resolver"):
-                ok, detail, resolver_result = download_tiktok_via_resolvers(url, args, ffmpeg)
-                if not ok:
-                    extra = f"{rejection} Resolver fallback failed: {resolver_result}"
-                else:
-                    extra = resolver_result
-            else:
-                ok, detail, extra = False, None, rejection
-
-    if ok:
-        saved_path = detail or f"Saved under {output_dir}"
-        compat_note = ""
-        transcoded = False
-        if args.ppt_compatible and detail:
-            saved_path, transcoded = make_powerpoint_compatible(detail, ffmpeg)
-            compat_note = " [PowerPoint-compatible]"
-            if not transcoded:
-                compat_note = " [PowerPoint-compatible, no re-encode needed]"
-
-        if extra == "direct":
-            route_note = "success_direct"
-        elif extra == "none":
-            route_note = "success_social"
-        elif extra.startswith("success_direct_hls_fallback"):
-            route_note = extra
-        elif extra.startswith("success_tiktok_resolver"):
-            route_note = extra
-        else:
-            route_note = f"success_social_cookies:{extra}"
-        duration_ms = int((time.monotonic() - started_at) * 1000)
-        metadata = {
-            "duration_ms": duration_ms,
-            "from_cache": False,
-            "used_cookies": extra not in {"none", "direct"}
-            and not extra.startswith(("success_direct_hls_fallback", "success_tiktok_resolver")),
-            "used_fallback": extra.startswith(("success_direct_hls_fallback", "success_tiktok_resolver")),
-            "transcoded": transcoded,
-            "error_category": "none",
-        }
-        return DownloadResult(url, True, f"{route_note}: {saved_path}{compat_note}", saved_path, route_note, metadata)
-
-    lowered = extra.lower()
-    error_detail = extra
-    if any(token in lowered for token in ["login", "sign in", "private", "authentication"]):
-        error_detail = f"auth_needed: {extra}"
-    elif any(token in lowered for token in ["timed out", "ssl", "network", "connection reset", "temporarily unavailable"]):
-        error_detail = f"network_unstable: {extra}"
-    elif "no supported urls were found" in lowered:
-        error_detail = f"input_invalid: {extra}"
-    duration_ms = int((time.monotonic() - started_at) * 1000)
-    metadata = {
-        "duration_ms": duration_ms,
-        "from_cache": False,
-        "used_cookies": False,
-        "used_fallback": extra.startswith("tiktok_resolver_failed:") or "Resolver fallback failed:" in extra,
-        "transcoded": False,
-        "error_category": classify_error_category(error_detail),
+    facts: dict[str, object] = {
+        "has_video": False,
+        "has_audio": False,
+        "media_state": "no_media_stream",
+        "basic_ppt_profile": False,
     }
-    return DownloadResult(url, False, error_detail, None, None, metadata)
+    probed: dict[str, object] | None = attempt.media_probe
+    if attempt.ok and attempt.path:
+        if probed is None:
+            probed = probe_media(attempt.path, ffmpeg)
+        facts = media_facts(attempt.path, ffmpeg, probed=probed)
+
+    if attempt.ok and attempt.path and not facts["has_video"]:
+        rejection = (
+            "downloaded media contained audio but no video stream"
+            if facts["has_audio"]
+            else "downloaded output contained neither a video nor an audio stream"
+        )
+        source_error = ErrorCode.AUDIO_ONLY_RESULT if facts["has_audio"] else ErrorCode.NO_MEDIA_STREAM
+        if resolver_allowed and attempt.route is not DownloadRoute.TIKTOK_RESOLVER:
+            attempt_number += 1
+            resolver_attempt = _run_bounded_route(
+                lambda: download_tiktok_via_resolvers(url, args, ffmpeg),
+                DownloadRoute.TIKTOK_RESOLVER,
+                output_dir,
+                batch_budget,
+            )
+            if resolver_attempt.ok and resolver_attempt.path:
+                attempt = resolver_attempt
+                probed = attempt.media_probe
+                if probed is None:
+                    probed = probe_media(attempt.path, ffmpeg)
+                facts = media_facts(attempt.path, ffmpeg, probed=probed)
+                if not facts["has_video"]:
+                    attempt = RouteResult(
+                        False,
+                        None,
+                        resolver_attempt.route,
+                        f"{rejection}; resolver output also had no video stream",
+                        resolver_attempt.browser,
+                        source_error,
+                        resolver_attempt.media_probe,
+                    )
+                    return _failure_result(
+                        url,
+                        attempt,
+                        source_error,
+                        attempt.detail,
+                        started_at,
+                        media_state=str(facts.get("media_state", "no_media_stream")),
+                        attempt_number=attempt_number,
+                        facts=facts,
+                    )
+            else:
+                attempt = RouteResult(
+                    False,
+                    None,
+                    resolver_attempt.route,
+                    f"{rejection}; resolver fallback failed: {resolver_attempt.detail}",
+                    error_code=source_error,
+                )
+                return _failure_result(
+                    url,
+                    attempt,
+                    source_error,
+                    attempt.detail,
+                    started_at,
+                    media_state=str(facts.get("media_state", "no_media_stream")),
+                    attempt_number=attempt_number,
+                    facts=facts,
+                )
+        else:
+            attempt = RouteResult(
+                False,
+                None,
+                attempt.route,
+                rejection,
+                attempt.browser,
+                source_error,
+            )
+            return _failure_result(
+                url,
+                attempt,
+                source_error,
+                rejection,
+                started_at,
+                media_state=str(facts.get("media_state", "no_media_stream")),
+                attempt_number=attempt_number,
+                facts=facts,
+            )
+
+    if attempt.ok and attempt.path and not facts["has_audio"]:
+        source_can_be_silent = is_direct_media_url(url) or attempt.route in {
+            DownloadRoute.DIRECT,
+            DownloadRoute.HLS_SEGMENTED,
+        }
+        if not source_can_be_silent:
+            if resolver_allowed and attempt.route is not DownloadRoute.TIKTOK_RESOLVER:
+                attempt_number += 1
+                resolver_attempt = _run_bounded_route(
+                    lambda: download_tiktok_via_resolvers(url, args, ffmpeg),
+                    DownloadRoute.TIKTOK_RESOLVER,
+                    output_dir,
+                    batch_budget,
+                )
+                if resolver_attempt.ok and resolver_attempt.path:
+                    attempt = resolver_attempt
+                    probed = attempt.media_probe
+                    if probed is None:
+                        probed = probe_media(attempt.path, ffmpeg)
+                    facts = media_facts(attempt.path, ffmpeg, probed=probed)
+                else:
+                    attempt = RouteResult(
+                        False,
+                        None,
+                        resolver_attempt.route,
+                        "downloaded social media had no audio stream; "
+                        f"resolver fallback failed: {resolver_attempt.detail}",
+                        error_code=ErrorCode.AUDIO_EXPECTED_BUT_MISSING,
+                    )
+            if not attempt.ok or not attempt.path or not facts["has_audio"]:
+                return _failure_result(
+                    url,
+                    attempt,
+                    ErrorCode.AUDIO_EXPECTED_BUT_MISSING,
+                    attempt.detail or "downloaded social media had no audio stream",
+                    started_at,
+                    media_state="video_only_source",
+                    attempt_number=attempt_number,
+                    facts=facts,
+                )
+
+    if not attempt.ok or not attempt.path:
+        return _failure_result(
+            url,
+            attempt,
+            _error_code_for_attempt(attempt),
+            attempt.detail or "download failed",
+            started_at,
+            attempt_number=attempt_number,
+        )
+
+    saved_path = attempt.path
+    transcoded = False
+    compat_note = ""
+    compatibility_reservation = 0
+    needs_compatibility_transcode = args.ppt_compatible and not bool(
+        facts.get("basic_ppt_profile", False)
+    )
+    if needs_compatibility_transcode and batch_budget is not None:
+        compatibility_reservation = MAX_DOWNLOAD_BYTES
+        if not batch_budget.reserve(compatibility_reservation):
+            return _failure_result(
+                url,
+                attempt,
+                ErrorCode.RESOURCE_LIMIT,
+                "batch budget is too small for the compatibility transcode",
+                started_at,
+                media_state=str(facts.get("media_state", "no_media_stream")),
+                attempt_number=attempt_number,
+                facts=facts,
+            )
+    if args.ppt_compatible:
+        try:
+            saved_path, transcoded = make_powerpoint_compatible(
+                saved_path,
+                ffmpeg,
+                force=getattr(args, "force", False),
+                keep_metadata=getattr(args, "keep_metadata", False),
+                probed=probed,
+            )
+            try:
+                compatibility_bytes = Path(saved_path).stat().st_size
+            except OSError:
+                compatibility_bytes = 0
+            if compatibility_bytes > MAX_DOWNLOAD_BYTES:
+                if transcoded:
+                    Path(saved_path).unlink(missing_ok=True)
+                if compatibility_reservation:
+                    batch_budget.settle(compatibility_reservation, 0)
+                    compatibility_reservation = 0
+                return _failure_result(
+                    url,
+                    attempt,
+                    ErrorCode.RESOURCE_LIMIT,
+                    f"compatibility output exceeded {MAX_DOWNLOAD_BYTES} bytes",
+                    started_at,
+                    media_state=str(facts.get("media_state", "no_media_stream")),
+                    attempt_number=attempt_number,
+                    transcoded=transcoded,
+                    facts=facts,
+                )
+
+            compat_note = " [basic PowerPoint profile]"
+            if not transcoded:
+                compat_note = " [basic PowerPoint profile, no re-encode needed]"
+            if transcoded:
+                final_probe = probe_media(saved_path, ffmpeg)
+                facts = media_facts(saved_path, ffmpeg, probed=final_probe)
+            if not facts["has_video"]:
+                if transcoded:
+                    Path(saved_path).unlink(missing_ok=True)
+                if compatibility_reservation:
+                    batch_budget.settle(compatibility_reservation, 0)
+                    compatibility_reservation = 0
+                return _failure_result(
+                    url,
+                    attempt,
+                    ErrorCode.NO_MEDIA_STREAM,
+                    "final output lost its video stream",
+                    started_at,
+                    media_state="no_media_stream",
+                    attempt_number=attempt_number,
+                    transcoded=transcoded,
+                    facts=facts,
+                )
+            if not facts["basic_ppt_profile"]:
+                if transcoded:
+                    Path(saved_path).unlink(missing_ok=True)
+                if compatibility_reservation:
+                    batch_budget.settle(compatibility_reservation, 0)
+                    compatibility_reservation = 0
+                return _failure_result(
+                    url,
+                    attempt,
+                    ErrorCode.COMPATIBILITY_VALIDATION_FAILED,
+                    "final output did not meet the basic H.264/AAC/MP4 profile",
+                    started_at,
+                    media_state=str(facts.get("media_state", "no_media_stream")),
+                    attempt_number=attempt_number,
+                    transcoded=transcoded,
+                    facts=facts,
+                )
+            if compatibility_reservation:
+                batch_budget.settle(compatibility_reservation, compatibility_bytes)
+                compatibility_reservation = 0
+        except BaseException:
+            if compatibility_reservation:
+                batch_budget.settle(compatibility_reservation, 0)
+            raise
+
+    if attempt.route is DownloadRoute.DIRECT:
+        route_note = "downloaded_direct"
+    elif attempt.route is DownloadRoute.SOCIAL:
+        route_note = "downloaded_social_with_cookies" if attempt.browser else "downloaded_social"
+    elif attempt.route is DownloadRoute.HLS_SEGMENTED:
+        route_note = "downloaded_hls_segmented"
+    elif attempt.route is DownloadRoute.TIKTOK_RESOLVER:
+        route_note = "downloaded_tiktok_resolver"
+    else:
+        route_note = attempt.route.value
+    if attempt.detail and attempt.route in {DownloadRoute.HLS_SEGMENTED, DownloadRoute.TIKTOK_RESOLVER}:
+        route_note = f"{route_note}: {attempt.detail}"
+    metadata = {
+        "duration_ms": int((time.monotonic() - started_at) * 1000),
+        "from_cache": False,
+        "used_cookies": attempt.browser is not None,
+        "used_fallback": attempt.route in {DownloadRoute.HLS_SEGMENTED, DownloadRoute.TIKTOK_RESOLVER},
+        "transcoded": transcoded,
+        "error_code": ErrorCode.NONE.value,
+        "media_state": facts.get("media_state", "audio_and_video"),
+        "attempt_number": attempt_number,
+        "bytes": Path(saved_path).stat().st_size if Path(saved_path).exists() else 0,
+        "has_video": bool(facts.get("has_video", False)),
+        "has_audio": bool(facts.get("has_audio", False)),
+        "basic_ppt_profile": bool(facts.get("basic_ppt_profile", False)),
+    }
+    silent_note = " [source has no audio track]" if facts.get("media_state") == "video_only_source" else ""
+    return DownloadResult(
+        url,
+        True,
+        f"{route_note}: {saved_path}{compat_note}{silent_note}",
+        saved_path,
+        attempt.route,
+        ErrorCode.NONE,
+        metadata,
+    )
 
 
-def print_summary(results: list[tuple[str, bool, str]]) -> None:
-    groups: dict[str, list[tuple[str, str]]] = {
+def print_summary(results: list[DownloadResult]) -> None:
+    groups: dict[str, list[DownloadResult]] = {
         "Succeeded": [],
         "Cached": [],
         "Dry Run": [],
         "Auth Required": [],
         "Network Unstable": [],
         "Restricted": [],
+        "Audio Missing": [],
+        "No Media": [],
+        "Resource Limits": [],
+        "HLS Failed": [],
         "Resolver Failed": [],
         "Input Invalid": [],
         "Other Failures": [],
     }
-    for url, ok, detail in results:
-        if detail.startswith("success_cached:"):
-            groups["Cached"].append((url, detail))
-        elif detail.startswith("dry_run:"):
-            groups["Dry Run"].append((url, detail))
-        elif ok:
-            groups["Succeeded"].append((url, detail))
-        elif detail.startswith("auth_needed:"):
-            groups["Auth Required"].append((url, detail))
-        elif detail.startswith("network_unstable:"):
-            groups["Network Unstable"].append((url, detail))
-        elif detail.startswith("restricted_audio_only:"):
-            groups["Restricted"].append((url, detail))
-        elif detail.startswith("tiktok_resolver_failed:"):
-            groups["Resolver Failed"].append((url, detail))
-        elif detail.startswith("input_invalid:"):
-            groups["Input Invalid"].append((url, detail))
+    for result in results:
+        if result.route is DownloadRoute.CACHE:
+            groups["Cached"].append(result)
+        elif result.route is DownloadRoute.DRY_RUN:
+            groups["Dry Run"].append(result)
+        elif result.ok:
+            groups["Succeeded"].append(result)
+        elif result.error_code is ErrorCode.AUTH_NEEDED:
+            groups["Auth Required"].append(result)
+        elif result.error_code is ErrorCode.NETWORK_UNSTABLE:
+            groups["Network Unstable"].append(result)
+        elif result.error_code in {ErrorCode.AUDIO_ONLY_RESULT, ErrorCode.NO_MEDIA_STREAM}:
+            groups["Restricted"].append(result)
+        elif result.error_code is ErrorCode.AUDIO_EXPECTED_BUT_MISSING:
+            groups["Audio Missing"].append(result)
+        elif result.error_code is ErrorCode.RESOURCE_LIMIT:
+            groups["Resource Limits"].append(result)
+        elif result.error_code is ErrorCode.HLS_DOWNLOAD_FAILED:
+            groups["HLS Failed"].append(result)
+        elif result.error_code is ErrorCode.TIKTOK_RESOLVER_FAILED:
+            groups["Resolver Failed"].append(result)
+        elif result.error_code is ErrorCode.INPUT_INVALID:
+            groups["Input Invalid"].append(result)
         else:
-            groups["Other Failures"].append((url, detail))
+            groups["Other Failures"].append(result)
 
     print(f"\nDownload summary ({len(results)} URLs):", file=sys.stderr)
     for title, entries in groups.items():
         if not entries:
             continue
         print(f"\n{title} ({len(entries)}):", file=sys.stderr)
-        for url, detail in entries:
-            print(f"- {url}", file=sys.stderr)
-            print(f"  {detail}", file=sys.stderr)
+        for result in entries:
+            print(f"- {redact_url(result.url)}", file=sys.stderr)
+            print(f"  {redact_text(result.message)}", file=sys.stderr)
+
+
+def cache_key_for(url: str, args: argparse.Namespace, output_dir: Path) -> str:
+    payload = {
+        "url": url,
+        "output_dir": str(output_dir),
+        "max_height": args.max_height,
+        "ppt_conversion": args.ppt_compatible,
+        "keep_metadata": getattr(args, "keep_metadata", False),
+        "identity_scope": identity_scope(args),
+        "route": "direct" if is_direct_media_url(url) else classify_platform(url),
+        "tiktok_shop": args.tiktok_shop,
+        "tiktok_resolver": bool(getattr(args, "tiktok_resolver", False)),
+        "tool_version": __version__,
+    }
+    return make_cache_key(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -583,19 +1077,35 @@ def main() -> int:
             print(render_kpi_report(args.kpi_report))
             return 0
 
-        yt_dlp, ffmpeg = ensure_dependencies(args.install_missing)
         urls = normalize_urls(collect_urls(args))
-        out_dir = output_directory(args)
-        cookie_browsers = available_cookie_browsers()
+        out_dir = output_directory(args, create=not args.dry_run)
+
+        # A dry run must not install dependencies, create directories, touch the
+        # cache salt, clean stale cache entries, or append KPI events.
+        if args.dry_run:
+            results: list[DownloadResult] = []
+            total = len(urls)
+            for index, url in enumerate(urls, start=1):
+                print(f"[{index}/{total}] Planning: {redact_url(url)}", file=sys.stderr)
+                result = process_url(url, args, "", "", out_dir, [], None)
+                results.append(result)
+            print_summary(results)
+            return 0
+
+        yt_dlp, ffmpeg = ensure_dependencies(args.install_missing)
+        cookie_browsers = available_cookie_browsers() if args.auto_cookies else []
         cache = load_cache()
-        results: list[tuple[str, bool, str]] = []
+        results: list[DownloadResult] = []
         metrics_events: list[dict[str, object]] = []
+        cache_updates: dict[str, dict[str, object]] = {}
         any_failed = False
         total = len(urls)
-        max_workers = min(max(1, args.concurrency), max(1, total))
+        max_workers = min(max(1, args.concurrency), MAX_URL_WORKERS, max(1, total))
+        batch_budget = BatchBudget(MAX_BATCH_BYTES)
+        run_id = uuid.uuid4().hex
 
         def run_with_progress(index: int, url: str) -> DownloadResult:
-            print(f"[{index}/{total}] Starting: {url}", file=sys.stderr)
+            print(f"[{index}/{total}] Starting: {redact_url(url)}", file=sys.stderr)
             result = process_url(
                 url,
                 args,
@@ -603,14 +1113,14 @@ def main() -> int:
                 ffmpeg,
                 out_dir,
                 cookie_browsers,
-                cache.get(url),
+                cache.get(cache_key_for(url, args, out_dir)),
+                batch_budget=batch_budget,
             )
-            _, ok, message, saved_path, _, _ = result
-            if ok:
-                label = Path(saved_path).name if saved_path else message
+            if result.ok:
+                label = Path(result.saved_path).name if result.saved_path else result.message
                 print(f"[{index}/{total}] Done: {label}", file=sys.stderr)
             else:
-                print(f"[{index}/{total}] Failed: {message}", file=sys.stderr)
+                print(f"[{index}/{total}] Failed: {result.message}", file=sys.stderr)
             return result
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -622,44 +1132,87 @@ def main() -> int:
                 ): index
                 for index, url in enumerate(urls, start=1)
             }
-            indexed_results: dict[int, tuple[str, bool, str]] = {}
+            indexed_results: dict[int, DownloadResult] = {}
             for future in concurrent.futures.as_completed(futures):
                 index = futures[future]
-                url, ok, message, saved_path, status, metadata = future.result()
-                if ok and saved_path and status:
+                url = urls[index - 1]
+                try:
+                    result = future.result()
+                except (KeyboardInterrupt, SystemExit):
+                    raise
+                except Exception as exc:
+                    bounded = redact_text(f"{type(exc).__name__}: {exc}")[:400]
+                    result = DownloadResult(
+                        url,
+                        False,
+                        f"worker exception: {bounded}",
+                        None,
+                        None,
+                        ErrorCode.WORKER_EXCEPTION,
+                        {
+                            "duration_ms": 0,
+                            "from_cache": False,
+                            "used_cookies": False,
+                            "used_fallback": False,
+                            "transcoded": False,
+                            "error_code": ErrorCode.WORKER_EXCEPTION.value,
+                            "media_state": "no_media_stream",
+                            "attempt_number": 1,
+                            "has_video": False,
+                            "has_audio": False,
+                            "basic_ppt_profile": False,
+                        },
+                    )
+                if result.ok and result.saved_path and result.route:
                     expires_at = (datetime.now(timezone.utc) + CACHE_TTL).strftime("%Y-%m-%dT%H:%M:%S%z")
-                    cache[url] = {
-                        "path": saved_path,
-                        "status": status,
+                    cache_updates[cache_key_for(result.url, args, out_dir)] = {
+                        "path": result.saved_path,
+                        "status": result.route.value,
                         "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S%z"),
                         "expires_at": expires_at,
+                        "media_state": str(result.metadata.get("media_state", "audio_and_video")),
+                        "has_audio": bool(result.metadata.get("has_audio", False)),
+                        "max_height": args.max_height,
+                        "ppt_conversion": args.ppt_compatible,
+                        "basic_ppt_profile": bool(result.metadata.get("basic_ppt_profile", False)),
+                        "keep_metadata": args.keep_metadata,
+                        "tool_version": __version__,
                     }
-                if not ok:
+                if not result.ok:
                     any_failed = True
-                indexed_results[index] = (url, ok, message)
-                facts = media_facts(saved_path, ffmpeg) if saved_path else media_facts(None, ffmpeg)
+                indexed_results[index] = result
+                facts = {
+                    "has_video": bool(result.metadata.get("has_video", False)),
+                    "has_audio": bool(result.metadata.get("has_audio", False)),
+                    "basic_ppt_profile": bool(result.metadata.get("basic_ppt_profile", False)),
+                }
                 metrics_events.append({
                     "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S%z"),
-                    "version": __version__,
-                    "url_hash": hashlib.sha1(url.encode("utf-8")).hexdigest()[:12],
-                    "platform": classify_platform(url),
-                    "flow_type": status or classify_error_category(message),
-                    "from_cache": metadata["from_cache"],
-                    "used_cookies": metadata["used_cookies"],
-                    "used_fallback": metadata["used_fallback"],
-                    "transcoded": metadata["transcoded"],
-                    "success": ok,
-                    "error_category": metadata["error_category"] if not ok else "none",
-                    "duration_ms": metadata["duration_ms"],
+                    "run_id": run_id,
+                    "event_schema_version": 2,
+                    "tool_version": __version__,
+                    "url_hash": hash_sensitive_text(result.url),
+                    "platform": classify_platform(result.url),
+                    "route": result.route.value if result.route else "unknown",
+                    "terminal_status": "success" if result.ok else "failure",
+                    "error_code": result.error_code.value,
+                    "attempt_number": result.metadata.get("attempt_number", 1),
+                    "from_cache": result.metadata.get("from_cache", False),
+                    "used_cookies": result.metadata.get("used_cookies", False),
+                    "used_fallback": result.metadata.get("used_fallback", False),
+                    "transcoded": result.metadata.get("transcoded", False),
+                    "success": result.ok,
+                    "duration_ms": result.metadata.get("duration_ms", 0),
+                    "bytes": int(result.metadata.get("bytes", 0) or 0),
                     "has_video": facts["has_video"],
                     "has_audio": facts["has_audio"],
-                    "ppt_compatible": facts["ppt_compatible"],
-                    "simulated": message.startswith("dry_run:"),
+                    "basic_ppt_profile": facts["basic_ppt_profile"],
+                    "simulated": result.route is DownloadRoute.DRY_RUN,
                 })
 
         results = [indexed_results[index] for index in sorted(indexed_results)]
 
-        save_cache(cache)
+        merge_cache_entries(cache_updates)
         append_metrics_events(metrics_events)
 
         print_summary(results)

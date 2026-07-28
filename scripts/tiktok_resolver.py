@@ -2,22 +2,28 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import html
 import os
 import re
+import sys
 import tempfile
 from pathlib import Path
 
 from constants import (
+    DownloadRoute,
+    ErrorCode,
+    RouteResult,
     SAFE_FILENAME_PATTERN,
     SNAPTIK_HOME_URL,
     SNAPTIK_SUBMIT_URL,
     SSSTIK_HOME_URL,
     SSSTIK_SUBMIT_URL,
+    redact_url,
     sanitize_filename,
 )
-from media_probe import has_audio_stream, has_video_stream
+from cache import hash_sensitive_text
+from file_ops import atomic_commit, non_conflicting_path
+from media_probe import media_facts, probe_media
 from net import curl_text_request, download_file_via_curl
 from urls import tiktok_video_id
 
@@ -109,16 +115,22 @@ def ssstik_candidates(url: str) -> tuple[list[str], str | None]:
 
 
 def resolver_target(url: str, title: str | None, args: argparse.Namespace) -> Path:
-    identifier = tiktok_video_id(url) or hashlib.sha1(url.encode("utf-8")).hexdigest()[:8]
+    identifier = tiktok_video_id(url) or hash_sensitive_text(url)[:8]
     filename = sanitize_filename(title or "tiktok-resolved-video")
-    return _output_directory(args) / f"{filename} [{identifier}].mp4"
+    target = _output_directory(args) / f"{filename} [{identifier}].mp4"
+    return non_conflicting_path(target, force=getattr(args, "force", False))
 
 
 def download_tiktok_via_resolvers(
     url: str, args: argparse.Namespace, ffmpeg: str
-) -> tuple[bool, str | None, str]:
+) -> RouteResult:
     provider_errors: list[str] = []
     providers = [("snaptik", snaptik_candidates), ("ssstik", ssstik_candidates)]
+    print(
+        "TikTok resolver opt-in: submitting the URL to SnapTik/SSSTik; "
+        f"URL shown without query data: {redact_url(url)}",
+        file=sys.stderr,
+    )
     for provider_name, provider in providers:
         try:
             candidates, title = provider(url)
@@ -126,20 +138,46 @@ def download_tiktok_via_resolvers(
                 provider_errors.append(f"{provider_name}: no video URL returned")
                 continue
             destination = resolver_target(url, title, args)
-            temp_destination = destination.with_name(f"{destination.stem} [resolver-tmp]{destination.suffix}")
             for candidate in candidates:
-                temp_destination.unlink(missing_ok=True)
+                descriptor, temp_name = tempfile.mkstemp(
+                    prefix=f".{destination.stem}.resolver-",
+                    suffix=destination.suffix,
+                    dir=destination.parent,
+                )
+                os.close(descriptor)
+                temp_destination = Path(temp_name)
                 try:
                     download_file_via_curl(candidate, temp_destination)
                 except RuntimeError as exc:
                     provider_errors.append(f"{provider_name}: {exc}")
-                    continue
-                if not has_video_stream(str(temp_destination), ffmpeg) or not has_audio_stream(str(temp_destination), ffmpeg):
                     temp_destination.unlink(missing_ok=True)
-                    provider_errors.append(f"{provider_name}: returned media without video and audio")
                     continue
-                os.replace(temp_destination, destination)
-                return True, str(destination), f"success_tiktok_resolver:{provider_name}"
+                try:
+                    probed = probe_media(str(temp_destination), ffmpeg)
+                    facts = media_facts(str(temp_destination), ffmpeg, probed=probed)
+                    if not facts["has_video"] or not facts["has_audio"]:
+                        provider_errors.append(f"{provider_name}: returned media without video and audio")
+                        continue
+                    atomic_commit(
+                        temp_destination,
+                        destination,
+                        force=getattr(args, "force", False),
+                    )
+                    return RouteResult(
+                        True,
+                        str(destination),
+                        DownloadRoute.TIKTOK_RESOLVER,
+                        provider_name,
+                        media_probe=probed,
+                    )
+                finally:
+                    temp_destination.unlink(missing_ok=True)
         except RuntimeError as exc:
             provider_errors.append(f"{provider_name}: {exc}")
-    return False, None, "tiktok_resolver_failed: " + "; ".join(provider_errors)
+    return RouteResult(
+        False,
+        None,
+        DownloadRoute.TIKTOK_RESOLVER,
+        "; ".join(provider_errors),
+        error_code=ErrorCode.TIKTOK_RESOLVER_FAILED,
+    )

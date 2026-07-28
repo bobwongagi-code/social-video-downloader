@@ -30,10 +30,10 @@ This project is designed around a different goal: stable, presentation-friendly 
 
 - Balanced output: targets practical file size and speed instead of max quality
 - Audio-aware: prefers video+audio combinations and avoids silent outputs
-- Presentation-ready: normalizes to `H.264 + AAC` only when needed
+- Presentation-friendly: normalizes to a basic `H.264 + AAC` MP4 profile only when needed
 - Stable download paths: separates social pages, direct media URLs, and HLS playlists
-- Recovery built in: supports retries, cookie fallback, HLS stall detection, and segmented fallback
-- TikTok restricted-video recovery: can use HTTP resolver providers when normal extraction fails or exposes audio only
+- Recovery built in: supports bounded retries, explicit cookie fallback, and a conservative HLS fallback
+- TikTok restricted-video recovery: can use HTTP resolver providers only when the user opts in
 - Repeated-work friendly: includes cache reuse and lightweight KPI logging
 - WhatsApp-ready local compression: uses two-pass bitrate budgeting and validates the final H.264/AAC file
 
@@ -58,11 +58,11 @@ Platform support ultimately depends on whether the current `yt-dlp` extractor ca
 - Quality target: cap height around `720p`
 - Audio: prefer video+audio output, avoid silent video files
 - Format: MP4 when remuxing or finalizing files
-- Playback compatibility: convert to `H.264 + AAC` only when needed
-- Cookies: retry with available local browser cookies when anonymous access fails
-- HLS: try fast `ffmpeg` capture first, then fall back to segmented recovery if needed
-- Cache: reuse a previously downloaded file only if it still exists and still contains both video and audio
-- TikTok resolver: normal TikTok links stay local-first; known Shop/promoted links can skip directly to resolver fallback
+- Playback profile: convert to a basic `H.264 + AAC` MP4 profile only when needed
+- Cookies: never read browser cookies unless `--auto-cookies` or `--cookies-from-browser` is explicit
+- HLS: accept only bounded, unencrypted MPEG-TS fallback playlists; advanced HLS is rejected rather than guessed
+- Cache: key includes URL digest, output directory, quality, basic-profile setting, metadata policy, identity scope, route, and tool version
+- TikTok resolver: disabled by default; `--tiktok-shop` explicitly submits the URL to SnapTik/SSSTik first
 - Local compression: preserve the source, target the requested size with a 0.90 safety margin, and write a new MP4
 
 ## Choose A Route
@@ -73,11 +73,11 @@ Platform support ultimately depends on whether the current `yt-dlp` extractor ca
 
 ## Requirements
 
-- Python 3.9+
+- Python 3.10+
 - `ffmpeg` and `ffprobe` (ffprobe is bundled with standard FFmpeg installs)
 - `yt-dlp` for the social URL download route
 
-On macOS, the script can auto-install missing `yt-dlp` and `ffmpeg` with Homebrew by default. On other platforms, install them manually before use.
+The downloader does not install dependencies or read browser cookies by default. Use `--install-missing` only when Homebrew installation is intended, and use `--auto-cookies` only when browser-cookie access is intended.
 
 The local compression helper does not install dependencies automatically; it requires `python3`, `ffmpeg`, and `ffprobe`.
 
@@ -150,16 +150,20 @@ bash scripts/compress_for_whatsapp.sh "/path/to/input.mp4" "/path/to/output.mp4"
 
 - `--output-dir`: write files somewhere other than `~/Downloads`
 - `--max-height`: change the default quality cap
-- `--no-ppt-compatible`: keep the raw downloaded file instead of normalizing for PowerPoint/QuickTime
+- `--no-ppt-compatible`: keep the raw downloaded file instead of normalizing to the basic H.264/AAC/MP4 profile
 - `--cookies-from-browser`: force a specific browser cookie source
 - `--concurrency`: control bounded parallel downloads for multi-URL batches
 - `--dry-run`: preview without downloading
-- `--tiktok-shop`: try TikTok HTTP resolver providers first for known Shop/promoted URLs
+- `--install-missing`: explicitly allow Homebrew dependency installation
+- `--auto-cookies`: explicitly allow retries with detected browser cookies
+- `--tiktok-shop`: explicitly submit TikTok Shop/promoted URLs to SnapTik/SSSTik first
 - `--no-tiktok-resolver`: disable third-party TikTok resolver fallback
+- `--force`: explicitly replace an existing downloader output
+- `--keep-metadata`: retain extractor metadata when the download route supports it
 - `--kpi-report`: summarize recent real-run metrics
 - `--version`: print the script version
 
-The compression helper accepts `TARGET_MB`, `SAFETY`, `PRESET`, and optional `--force` as positional arguments. It requires `ffmpeg`, `ffprobe`, and `python3`.
+The compression helper accepts `TARGET_MB`, `SAFETY`, and `PRESET` as positional arguments. `--force` is an optional flag and may appear anywhere. It requires `ffmpeg`, `ffprobe`, and `python3`.
 
 ## Repository Layout
 
@@ -172,7 +176,10 @@ social-video-downloader/
 │   └── openai.yaml
 └── scripts/
     ├── compress_for_whatsapp.sh
-    └── download_social_video.py
+    ├── download_social_video.py
+    ├── hls.py
+    ├── media_probe.py
+    └── net.py
 ```
 
 Local runtime artifacts are intentionally ignored:
@@ -185,10 +192,11 @@ Local runtime artifacts are intentionally ignored:
 
 - This project is not affiliated with TikTok, Instagram, Facebook, X/Twitter, YouTube, or Xiaohongshu.
 - Some platforms require login state depending on region and content restrictions.
-- Restricted sources may expose only audio; those are treated as failures instead of fake success.
-- For TikTok only, the script may submit the input URL to SnapTik and then SSSTik when `--tiktok-shop` is set or local extraction cannot produce usable video and audio. Use `--no-tiktok-resolver` to disable this third-party fallback.
-- The defaults are optimized for day-to-day sharing, playback, and presentation use, not archival-quality collection.
-- KPI reports exclude `--dry-run` events from scoring so the metrics stay meaningful.
+- A direct source with no audio is retained and reported as `video_only_source`; a social extraction that is expected to have audio but loses it is reported as `audio_expected_but_missing`.
+- TikTok URLs are submitted to SnapTik/SSSTik only with explicit `--tiktok-shop` or `--tiktok-resolver`; the command prints this disclosure before the request.
+- Logs and cache keys redact or hash URL query data. Do not enable `--keep-metadata` when the output is intended to remove source attribution.
+- The defaults are optimized for day-to-day sharing, playback, and presentation workflows, not archival-quality collection; the basic media profile is not a guarantee for every PowerPoint or platform version.
+- `--dry-run` is read-only and does not create KPI events.
 - Users are responsible for complying with the target platform's terms of service and local laws when downloading content.
 
 ## License

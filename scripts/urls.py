@@ -3,9 +3,14 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from urllib.parse import unquote_plus, urlparse, urlsplit, urlunsplit
 
-from constants import DIRECT_MEDIA_EXTENSIONS, TRACKING_QUERY_KEYS, TRACKING_QUERY_PREFIXES, URL_PATTERN
+from constants import (
+    DIRECT_MEDIA_EXTENSIONS,
+    TRACKING_QUERY_KEYS,
+    TRACKING_QUERY_PREFIXES,
+    URL_PATTERN,
+)
 
 
 def extract_urls_from_text(text: str) -> list[str]:
@@ -16,8 +21,9 @@ def collect_urls(args: argparse.Namespace) -> list[str]:
     urls: list[str] = []
     seen: set[str] = set()
     chunks = list(args.inputs)
-    if args.text_file:
-        text_file = Path(args.text_file).expanduser()
+    text_file_value = getattr(args, "text_file", None)
+    if text_file_value:
+        text_file = Path(text_file_value).expanduser()
         if not text_file.exists():
             raise RuntimeError(f"--text-file does not exist: {text_file}")
         if not text_file.is_file():
@@ -25,8 +31,9 @@ def collect_urls(args: argparse.Namespace) -> list[str]:
         chunks.append(text_file.read_text(encoding="utf-8"))
 
     for chunk in chunks:
-        candidates = [chunk] if chunk.startswith(("http://", "https://")) else extract_urls_from_text(chunk)
+        candidates = extract_urls_from_text(chunk)
         for candidate in candidates:
+            candidate = candidate.rstrip(".,;!?]")
             if candidate not in seen:
                 seen.add(candidate)
                 urls.append(candidate)
@@ -41,14 +48,19 @@ def normalize_urls(urls: list[str]) -> list[str]:
     normalized: list[str] = []
     seen: set[str] = set()
     for url in urls:
-        cleaned = url.rstrip(".,;!?")
-        parsed = urlparse(cleaned)
-        query_items = [
-            (key, value)
-            for key, value in parse_qsl(parsed.query, keep_blank_values=True)
-            if key not in TRACKING_QUERY_KEYS and not key.startswith(TRACKING_QUERY_PREFIXES)
-        ]
-        cleaned = urlunparse(parsed._replace(query=urlencode(query_items), fragment=""))
+        cleaned = url.rstrip(".,;!?]")
+        parsed = urlsplit(cleaned)
+        host = (parsed.hostname or "").lower()
+        if _is_known_social_page_host(host) and not is_direct_media_url(cleaned):
+            query_parts = []
+            for part in parsed.query.split("&") if parsed.query else []:
+                key = unquote_plus(part.split("=", 1)[0]).lower()
+                if key in TRACKING_QUERY_KEYS or key.startswith(TRACKING_QUERY_PREFIXES):
+                    continue
+                query_parts.append(part)
+            cleaned = urlunsplit(
+                (parsed.scheme, parsed.netloc, parsed.path, "&".join(query_parts), "")
+            )
         if cleaned not in seen:
             seen.add(cleaned)
             normalized.append(cleaned)
@@ -56,16 +68,16 @@ def normalize_urls(urls: list[str]) -> list[str]:
 
 
 def classify_platform(url: str) -> str:
-    host = urlparse(url).netloc.lower()
-    if "tiktok.com" in host or "douyin" in host:
+    host = (urlparse(url).hostname or "").lower()
+    if _is_tiktok_host(host) or host == "douyin.com" or host.endswith(".douyin.com"):
         return "tiktok"
-    if "instagram.com" in host:
+    if host == "instagram.com" or host.endswith(".instagram.com"):
         return "instagram"
-    if "facebook.com" in host or "fb.watch" in host:
+    if host == "facebook.com" or host.endswith(".facebook.com") or host == "fb.watch":
         return "facebook"
-    if "twitter.com" in host or "x.com" in host:
+    if host in {"twitter.com", "x.com"} or host.endswith(".twitter.com"):
         return "x"
-    if "youtube.com" in host or "youtu.be" in host:
+    if host == "youtube.com" or host.endswith(".youtube.com") or host == "youtu.be":
         return "youtube"
     return "direct-media" if is_direct_media_url(url) else host or "unknown"
 
@@ -76,12 +88,33 @@ def is_direct_media_url(url: str) -> bool:
 
 
 def is_tiktok_url(url: str) -> bool:
-    import re
     host = (urlparse(url).hostname or "").lower()
-    return host == "tiktok.com" or host.endswith(".tiktok.com")
+    return _is_tiktok_host(host)
 
 
 def tiktok_video_id(url: str) -> str | None:
     import re
     match = re.search(r"/video/(\d+)", urlparse(url).path)
     return match.group(1) if match else None
+
+
+def _is_tiktok_host(host: str) -> bool:
+    return host == "tiktok.com" or host.endswith(".tiktok.com")
+
+
+def _is_known_social_page_host(host: str) -> bool:
+    return (
+        _is_tiktok_host(host)
+        or host == "instagram.com"
+        or host.endswith(".instagram.com")
+        or host == "facebook.com"
+        or host.endswith(".facebook.com")
+        or host == "fb.watch"
+        or host == "twitter.com"
+        or host.endswith(".twitter.com")
+        or host == "x.com"
+        or host.endswith(".x.com")
+        or host == "youtube.com"
+        or host.endswith(".youtube.com")
+        or host == "youtu.be"
+    )

@@ -4,15 +4,21 @@ All notable changes to this project will be documented in this file.
 
 This changelog starts from the current public-repository baseline.
 
-## [Unreleased]
+## [0.5.0] - 2026-07-28
 
 ### Added
 
 - WhatsApp compression helper for local videos with exact-duration bitrate budgeting, two-pass H.264 encoding, and final media validation
+- Real FFmpeg integration coverage for size limits, stream validation, rotation, silent sources, and overwrite protection
 
 ### Changed
 
 - Clarified the skill as a dual-route video media workflow: social URL download and local WhatsApp compression
+- Disabled implicit dependency installation, browser-cookie access, and third-party TikTok resolver calls
+- Added private salted cache keys, atomic no-clobber output commits, bounded HLS/network handling, and read-only dry runs
+- Classified video-only, audio-only, missing-audio, and no-media outcomes separately
+- Added metadata-policy-aware cache keys, live-playlist rejection, preflight disk/batch reservations, and structured route/error results
+- Clarified that the download compatibility check is a basic H.264/AAC/MP4 profile rather than a universal PowerPoint guarantee
 
 ## [0.4.0] - 2026-05-26
 

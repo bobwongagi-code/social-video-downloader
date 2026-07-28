@@ -1,4 +1,6 @@
 import importlib.util
+import contextlib
+import io
 import sys
 import tempfile
 import unittest
@@ -15,7 +17,9 @@ import constants
 import hls
 import cache as cache_mod
 import media_probe
+import net
 import tiktok_resolver
+import urls
 import download_social_video as main_mod
 
 
@@ -34,6 +38,13 @@ class BuildSegmentUrlTests(unittest.TestCase):
         )
         self.assertEqual(resolved, "https://cdn.example.com/hls/chunk.ts?part=1")
 
+    def test_cross_origin_segment_does_not_receive_playlist_query(self) -> None:
+        resolved = hls.build_segment_url(
+            "https://playlist.example.com/hls/master.m3u8?token=secret",
+            "https://cdn.example.net/media/seg-1.ts",
+        )
+        self.assertEqual(resolved, "https://cdn.example.net/media/seg-1.ts")
+
 
 class HlsPlaylistParsingTests(unittest.TestCase):
     def test_extract_variant_and_media_entries(self) -> None:
@@ -47,18 +58,256 @@ hi/index.m3u8
         self.assertEqual(media_segments, [])
         self.assertEqual(variants, [(64000, "low/index.m3u8"), (128000, "hi/index.m3u8")])
 
+    def test_encrypted_playlist_is_rejected_by_simple_fallback(self) -> None:
+        with self.assertRaises(hls.UnsupportedHlsPlaylist):
+            hls.extract_hls_playlist_entries(
+                "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"key\"\n#EXTINF:2,\nsegment.ts\n"
+            )
+
+    def test_segment_count_is_bounded(self) -> None:
+        playlist = "#EXTM3U\n" + "".join(
+            f"#EXTINF:2,\nsegment-{index}.ts\n"
+            for index in range(constants.HLS_MAX_SEGMENTS + 1)
+        )
+        with self.assertRaises(hls.UnsupportedHlsPlaylist):
+            hls.extract_hls_playlist_entries(playlist)
+
+    def test_live_media_playlist_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with unittest.mock.patch.object(
+                hls,
+                "resolve_hls_media_playlist_url",
+                return_value="https://cdn.example.com/live.m3u8",
+            ), unittest.mock.patch.object(
+                hls,
+                "fetch_text_via_curl",
+                return_value="#EXTM3U\n#EXTINF:2,\nsegment.ts\n",
+            ):
+                result = hls.download_hls_via_segments(
+                    "https://cdn.example.com/live.m3u8",
+                    Path(tmp_dir) / "live.mp4",
+                    "ffmpeg",
+                )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.route, constants.DownloadRoute.HLS_SEGMENTED)
+        self.assertEqual(result.error_code, constants.ErrorCode.HLS_DOWNLOAD_FAILED)
+        self.assertIn("ENDLIST", result.detail)
+
+
+class UrlSafetyTests(unittest.TestCase):
+    def test_signed_direct_url_is_preserved_byte_for_byte(self) -> None:
+        signed = "https://cdn.example.com/video.mp4?X-Amz-Signature=a%2Fb%3D&ref=required#fragment"
+        self.assertEqual(urls.normalize_urls([signed]), [signed])
+
+    def test_social_tracking_parameters_are_removed_without_reserializing_signature(self) -> None:
+        social = "https://www.tiktok.com/@name/video/123?xsec_token=a%2Fb%3D&utm_source=share"
+        self.assertEqual(
+            urls.normalize_urls([social]),
+            ["https://www.tiktok.com/@name/video/123?xsec_token=a%2Fb%3D"],
+        )
+
+    def test_text_starting_with_http_still_extracts_multiple_urls(self) -> None:
+        args = SimpleNamespace(
+            inputs=["https://one.example/a text https://two.example/b"],
+            text_file=None,
+        )
+        self.assertEqual(
+            urls.collect_urls(args),
+            ["https://one.example/a", "https://two.example/b"],
+        )
+
+    def test_unsafe_resolved_address_is_rejected(self) -> None:
+        with unittest.mock.patch.object(
+            net.socket,
+            "getaddrinfo",
+            return_value=[(net.socket.AF_INET, net.socket.SOCK_STREAM, 6, "", ("127.0.0.1", 80))],
+        ):
+            with self.assertRaises(net.UnsafeRemoteUrlError):
+                net.validate_remote_url("https://example.com/video.m3u8")
+
+
+class CacheContractTests(unittest.TestCase):
+    def test_cache_key_changes_with_output_constraints_and_does_not_store_url(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            with unittest.mock.patch.object(cache_mod, "CACHE_PATH", root / "downloads.json"), unittest.mock.patch.object(
+                cache_mod, "CACHE_SALT_PATH", root / ".salt"
+            ):
+                base = {"url": "https://cdn.example/video.mp4?sig=secret", "max_height": 720}
+                changed = {**base, "max_height": 1080}
+                first = cache_mod.make_cache_key(base)
+                second = cache_mod.make_cache_key(changed)
+                self.assertNotEqual(first, second)
+                self.assertRegex(first, r"^[0-9a-f]{64}$")
+                self.assertFalse((root / "downloads.json").exists())
+
+    def test_cache_key_includes_output_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            with unittest.mock.patch.object(cache_mod, "CACHE_PATH", root / "downloads.json"), unittest.mock.patch.object(
+                cache_mod, "CACHE_SALT_PATH", root / ".salt"
+            ):
+                args = SimpleNamespace(
+                    cookies_from_browser=None,
+                    auto_cookies=False,
+                    max_height=720,
+                    ppt_compatible=True,
+                    tiktok_shop=False,
+                    tiktok_resolver=False,
+                )
+                first = main_mod.cache_key_for(
+                    "https://example.com/video",
+                    args,
+                    root / "one",
+                )
+                second = main_mod.cache_key_for(
+                    "https://example.com/video",
+                    args,
+                    root / "two",
+                )
+                self.assertNotEqual(first, second)
+
+    def test_cache_key_includes_metadata_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            with unittest.mock.patch.object(cache_mod, "CACHE_PATH", root / "downloads.json"), unittest.mock.patch.object(
+                cache_mod, "CACHE_SALT_PATH", root / ".salt"
+            ):
+                args = SimpleNamespace(
+                    cookies_from_browser=None,
+                    auto_cookies=False,
+                    max_height=720,
+                    ppt_compatible=True,
+                    keep_metadata=False,
+                    tiktok_shop=False,
+                    tiktok_resolver=False,
+                )
+                first = main_mod.cache_key_for("https://example.com/video", args, root / "out")
+                args.keep_metadata = True
+                second = main_mod.cache_key_for("https://example.com/video", args, root / "out")
+                self.assertNotEqual(first, second)
+
+
+class ResourceBoundaryTests(unittest.TestCase):
+    def test_route_reserves_before_download_and_settles_actual_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output = Path(tmp_dir) / "video.mp4"
+            budget = main_mod.BatchBudget(constants.MAX_DOWNLOAD_BYTES * 2)
+
+            def route() -> constants.RouteResult:
+                output.write_bytes(b"x" * 10)
+                return constants.RouteResult(True, str(output), constants.DownloadRoute.DIRECT)
+
+            with unittest.mock.patch.object(main_mod, "free_bytes", return_value=constants.MIN_FREE_DISK_BYTES):
+                result = main_mod._run_bounded_route(
+                    route,
+                    constants.DownloadRoute.DIRECT,
+                    Path(tmp_dir),
+                    budget,
+                )
+            self.assertTrue(result.ok)
+            self.assertEqual(budget.used, 10)
+
+    def test_route_rejects_low_free_space_before_factory_runs(self) -> None:
+        factory = unittest.mock.Mock()
+        with tempfile.TemporaryDirectory() as tmp_dir, unittest.mock.patch.object(
+            main_mod, "free_bytes", return_value=0
+        ):
+            result = main_mod._run_bounded_route(
+                factory,
+                constants.DownloadRoute.DIRECT,
+                Path(tmp_dir),
+                None,
+            )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_code, constants.ErrorCode.RESOURCE_LIMIT)
+        self.assertNotIn("resource_limit:", result.detail)
+        factory.assert_not_called()
+
+
+class CliContractTests(unittest.TestCase):
+    def test_sensitive_defaults_are_opt_in(self) -> None:
+        with unittest.mock.patch.object(
+            sys,
+            "argv",
+            ["download_social_video.py", "https://example.com/video"],
+        ):
+            args = main_mod.parse_args()
+        self.assertFalse(args.install_missing)
+        self.assertFalse(args.auto_cookies)
+        self.assertFalse(args.tiktok_resolver)
+
+    def test_build_command_does_not_embed_metadata_or_force_overwrite_by_default(self) -> None:
+        args = SimpleNamespace(
+            max_height=720,
+            ppt_compatible=True,
+            cookies_from_browser=None,
+            force=False,
+            keep_metadata=False,
+        )
+        with unittest.mock.patch.object(main_mod, "hash_sensitive_text", return_value="deadbeef"):
+            command = main_mod.build_command(
+                "https://example.com/video",
+                args,
+                "yt-dlp",
+                "ffmpeg",
+                Path("/tmp/output"),
+            )
+        self.assertIn("--no-overwrites", command)
+        self.assertNotIn("--embed-metadata", command)
+        self.assertNotIn("--force-overwrites", command)
+
+
+class DryRunContractTests(unittest.TestCase):
+    def test_dry_run_does_not_create_output_or_cache_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir) / "new-output"
+            args = SimpleNamespace(
+                kpi_report=None,
+                inputs=["https://www.example.com/video"],
+                text_file=None,
+                dry_run=True,
+                output_dir=str(output_dir),
+                tiktok_shop=False,
+                tiktok_resolver=False,
+                max_height=720,
+                concurrency=1,
+                auto_cookies=False,
+                install_missing=False,
+                ppt_compatible=True,
+                cookies_from_browser=None,
+                force=False,
+                keep_metadata=False,
+            )
+            with unittest.mock.patch.object(main_mod, "parse_args", return_value=args), unittest.mock.patch.object(
+                main_mod, "ensure_dependencies", side_effect=AssertionError("dry-run installed dependencies")
+            ), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(main_mod.main(), 0)
+            self.assertFalse(output_dir.exists())
+
+
+class MediaProbeContractTests(unittest.TestCase):
+    def test_display_dimensions_apply_rotation_and_sample_aspect_ratio(self) -> None:
+        dimensions = media_probe._display_dimensions(
+            {
+                "width": 1920,
+                "height": 1080,
+                "sample_aspect_ratio": "2:1",
+                "side_data_list": [{"rotation": 90}],
+            }
+        )
+        self.assertEqual(dimensions, (1080, 3840))
+
 
 class CacheUsabilityTests(unittest.TestCase):
-    def test_cached_file_requires_audio(self) -> None:
+    def test_cached_video_only_file_is_usable(self) -> None:
         with unittest.mock.patch.object(
-            media_probe, "has_video_stream", return_value=True
-        ), unittest.mock.patch.object(
-            media_probe, "has_audio_stream", return_value=False
+            media_probe, "probe_media", return_value={"video": {"codec_name": "h264"}, "audio": {}}
         ), unittest.mock.patch("pathlib.Path.exists", return_value=True), unittest.mock.patch(
             "pathlib.Path.is_file", return_value=True
         ), unittest.mock.patch("pathlib.Path.stat") as mock_stat:
             mock_stat.return_value.st_size = 10
-            self.assertFalse(media_probe.cached_file_is_usable("/tmp/video.mp4", "/usr/bin/ffmpeg"))
+            self.assertTrue(media_probe.cached_file_is_usable("/tmp/video.mp4", "/usr/bin/ffmpeg"))
 
 
 class TikTokResolverParsingTests(unittest.TestCase):
@@ -94,7 +343,12 @@ class TikTokResolverRoutingTests(unittest.TestCase):
             with unittest.mock.patch.object(
                 main_mod,
                 "download_tiktok_via_resolvers",
-                return_value=(True, saved_path, "success_tiktok_resolver:snaptik"),
+                return_value=constants.RouteResult(
+                    True,
+                    saved_path,
+                    constants.DownloadRoute.TIKTOK_RESOLVER,
+                    "snaptik",
+                ),
             ) as mock_resolver, unittest.mock.patch.object(
                 main_mod, "try_download_with_fallbacks"
             ) as mock_ytdlp, unittest.mock.patch.object(
@@ -112,9 +366,9 @@ class TikTokResolverRoutingTests(unittest.TestCase):
                     None,
                 )
 
-        self.assertTrue(result[1])
-        self.assertEqual(result[4], "success_tiktok_resolver:snaptik")
-        self.assertTrue(result[5]["used_fallback"])
+        self.assertTrue(result.ok)
+        self.assertEqual(result.route, constants.DownloadRoute.TIKTOK_RESOLVER)
+        self.assertTrue(result.metadata["used_fallback"])
         mock_resolver.assert_called_once()
         mock_ytdlp.assert_not_called()
 
@@ -130,11 +384,20 @@ class TikTokResolverRoutingTests(unittest.TestCase):
             ), unittest.mock.patch.object(
                 main_mod,
                 "download_tiktok_via_resolvers",
-                return_value=(True, resolved_path, "success_tiktok_resolver:snaptik"),
+                return_value=constants.RouteResult(
+                    True,
+                    resolved_path,
+                    constants.DownloadRoute.TIKTOK_RESOLVER,
+                    "snaptik",
+                ),
             ) as mock_resolver, unittest.mock.patch.object(
                 main_mod,
                 "media_facts",
-                return_value={"has_video": False, "has_audio": True},
+                side_effect=[
+                    {"has_video": False, "has_audio": True},
+                    {"has_video": True, "has_audio": True},
+                    {"has_video": True, "has_audio": True},
+                ],
             ):
                 result = main_mod.process_url(
                     "https://www.tiktok.com/@shop/video/123456",
@@ -146,9 +409,9 @@ class TikTokResolverRoutingTests(unittest.TestCase):
                     None,
                 )
 
-        self.assertTrue(result[1])
-        self.assertEqual(result[4], "success_tiktok_resolver:snaptik")
-        self.assertTrue(result[5]["used_fallback"])
+        self.assertTrue(result.ok)
+        self.assertEqual(result.route, constants.DownloadRoute.TIKTOK_RESOLVER)
+        self.assertTrue(result.metadata["used_fallback"])
         mock_resolver.assert_called_once()
 
     def test_resolver_opt_out_overrides_tiktok_shop_hint(self) -> None:
@@ -175,8 +438,8 @@ class TikTokResolverRoutingTests(unittest.TestCase):
                     None,
                 )
 
-        self.assertTrue(result[1])
-        self.assertEqual(result[4], "success_social")
+        self.assertTrue(result.ok)
+        self.assertEqual(result.route, constants.DownloadRoute.SOCIAL)
         mock_ytdlp.assert_called_once()
         mock_resolver.assert_not_called()
 
@@ -197,7 +460,7 @@ class TikTokResolverRoutingTests(unittest.TestCase):
                     None,
                 )
 
-        self.assertFalse(result[1])
+        self.assertFalse(result.ok)
         mock_resolver.assert_not_called()
 
     def test_resolver_rejects_media_without_audio(self) -> None:
@@ -216,17 +479,17 @@ class TikTokResolverRoutingTests(unittest.TestCase):
             ), unittest.mock.patch.object(
                 tiktok_resolver, "download_file_via_curl", side_effect=write_candidate
             ), unittest.mock.patch.object(
-                tiktok_resolver, "has_video_stream", return_value=True
-            ), unittest.mock.patch.object(
-                tiktok_resolver, "has_audio_stream", return_value=False
+                tiktok_resolver,
+                "media_facts",
+                return_value={"has_video": True, "has_audio": False},
             ):
-                ok, detail, extra = tiktok_resolver.download_tiktok_via_resolvers(
+                result = tiktok_resolver.download_tiktok_via_resolvers(
                     "https://www.tiktok.com/@shop/video/123456", args, "ffmpeg"
                 )
 
-        self.assertFalse(ok)
-        self.assertIsNone(detail)
-        self.assertIn("without video and audio", extra)
+        self.assertFalse(result.ok)
+        self.assertIsNone(result.path)
+        self.assertIn("without video and audio", result.detail)
 
 
 if __name__ == "__main__":

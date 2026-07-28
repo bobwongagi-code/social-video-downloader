@@ -31,11 +31,14 @@ def install_with_homebrew(packages: list[str]) -> None:
 def ensure_dependencies(install_missing: bool) -> tuple[str, str]:
     yt_dlp = which_or_none("yt-dlp")
     ffmpeg = which_or_none("ffmpeg")
+    ffprobe = which_or_none("ffprobe")
     missing = []
     if yt_dlp is None:
         missing.append("yt-dlp")
     if ffmpeg is None:
         missing.append("ffmpeg")
+    if ffprobe is None and ffmpeg is not None:
+        missing.append("ffprobe")
 
     if missing:
         if not install_missing:
@@ -44,12 +47,18 @@ def ensure_dependencies(install_missing: bool) -> tuple[str, str]:
                 + ", ".join(missing)
                 + ". Re-run with --install-missing or install them manually."
             )
+        if "ffprobe" in missing:
+            raise RuntimeError(
+                "Missing required dependency: ffprobe. Install it alongside FFmpeg; "
+                "automatic Homebrew installation is intentionally not attempted for ffprobe alone."
+            )
         install_with_homebrew(missing)
         yt_dlp = which_or_none("yt-dlp")
         ffmpeg = which_or_none("ffmpeg")
+        ffprobe = which_or_none("ffprobe")
 
-    if yt_dlp is None or ffmpeg is None:
-        raise RuntimeError("Unable to locate yt-dlp and ffmpeg after installation.")
+    if yt_dlp is None or ffmpeg is None or ffprobe is None:
+        raise RuntimeError("Unable to locate yt-dlp, ffmpeg, and ffprobe after installation.")
 
     return yt_dlp, ffmpeg
 

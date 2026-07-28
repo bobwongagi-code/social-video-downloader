@@ -28,7 +28,7 @@ Do not paste browser cookies, session tokens, or other secrets into public issue
 Run these before opening a pull request:
 
 ```bash
-python3 -m py_compile scripts/download_social_video.py
+python3 -m py_compile scripts/*.py tests/*.py
 python3 -m unittest discover -s tests -p 'test_*.py'
 python3 scripts/validate_repo.py
 bash -n scripts/compress_for_whatsapp.sh
@@ -46,7 +46,7 @@ For manual stability checks against real long-running platform samples, see:
 - Update `CHANGELOG.md` for notable user-facing changes
 - If you change the script version, update both:
   - `_meta.json`
-  - `scripts/download_social_video.py`
+  - `scripts/constants.py`
 
 ## Platform and Compliance Notes
 
