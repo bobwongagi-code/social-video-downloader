@@ -31,9 +31,9 @@ python3 "${CODEX_HOME:-$HOME/.codex}/skills/social-video-downloader/scripts/down
 1. Accept one or more URLs from TikTok, Instagram, Facebook, X/Twitter, YouTube, or YouTube Shorts.
 2. Save output to `~/Downloads` unless the user explicitly asks for another directory.
 3. Use the bundled script instead of hand-writing `yt-dlp` commands.
-4. Route normal social-media page URLs through `yt-dlp`, but route direct media URLs such as `.m3u8` and `.mp4` through the script's dedicated direct-download path instead of forcing page-extractor logic.
-5. For a TikTok URL explicitly described as Shop, promoted, commerce, or restricted, pass `--tiktok-shop` so the script explicitly discloses and submits it to the HTTP resolver providers before ordinary TikTok extraction. Do not use browser automation for this first-stage path.
-6. For other TikTok URLs, keep `yt-dlp` as the first path. Do not submit the URL to third-party resolver providers unless the user explicitly enables `--tiktok-resolver`.
+4. Route non-TikTok social-media page URLs through `yt-dlp`, but route direct media URLs such as `.m3u8` and `.mp4` through the script's dedicated direct-download path instead of forcing page-extractor logic.
+5. For every TikTok page URL, use the basic downloader command: HTTP resolvers are now the default route, trying SnapTik then SSSTik. This is the preferred route based on prior successful downloads, not a guarantee of future success. Tell the user the URL will be submitted to these third-party services; the script also prints this disclosure before requests. Do not use browser automation or hand-written `yt-dlp` as the first path.
+6. Do not automatically retry failed TikTok resolver downloads with ordinary `yt-dlp`. Only pass `--no-tiktok-resolver` if the user explicitly declines third-party submission or requests ordinary extraction. `--tiktok-shop` remains a compatibility hint but is no longer needed to select the preferred route.
 7. Prefer balanced quality capped at roughly 720p for normal social-page downloads. Do not intentionally download the highest available bitrate or resolution unless the user asks for it.
 8. For direct media URLs, prioritize stable capture over format negotiation. Download the supplied media stream directly, then only normalize it afterward if compatibility work is needed.
 9. For direct `.m3u8` URLs, use the safe simple-HLS fallback only for bounded, unencrypted MPEG-TS playlists. Reject encrypted, fMP4, alternate-audio, byte-range, discontinuity, and live-refresh tags instead of guessing.
@@ -42,7 +42,7 @@ python3 "${CODEX_HOME:-$HOME/.codex}/skills/social-video-downloader/scripts/down
 12. Normalize the downloaded result to a basic `H.264 + AAC` MP4 media profile unless the user explicitly says not to, but skip the re-encode entirely when the downloaded file already meets that profile. This is a codec/profile check, not a guarantee for every PowerPoint or platform version.
 13. Never install dependencies or read browser cookies implicitly. Use `--install-missing` or `--cookies-from-browser`; use `--auto-cookies` only after the user explicitly permits browser-cookie access.
 14. Reuse a previously downloaded local file only when the cache key matches URL, output directory, quality, basic-profile setting, metadata policy, identity scope, route, and tool version, and the file still contains a video stream.
-15. Read the download summary and report back which files succeeded and where they were saved.
+15. Read the download summary and report back which files succeeded and where they were saved. A TikTok success message includes `downloaded_tiktok_resolver: snaptik` or `downloaded_tiktok_resolver: ssstik`, identifying the successful provider. Do not infer a provider from route preference alone.
 16. Treat resolver results as untrusted until the final file passes both video-stream and audio-stream validation; never report an audio-only result as success.
 17. For multi-URL work, keep parallelism bounded, show per-URL start/finish updates during the run, and preserve the final summary in the original input order.
 
@@ -85,7 +85,7 @@ Do not require the user to mention the skill name. A supported social-media URL 
 - Playlist handling: download only the requested item unless the user explicitly asks for a playlist
 - Batch behavior: accept multiple URLs directly or extract multiple URLs from a pasted text block
 - Restricted-source behavior: classify `audio_only_result`, `no_media_stream`, `audio_expected_but_missing`, and `video_only_source` separately; never report an audio-only result as success
-- TikTok resolver behavior: for a known TikTok Shop/promoted URL, use `--tiktok-shop` to explicitly submit it to HTTP resolver providers first; other TikTok links remain local-only unless `--tiktok-resolver` is explicit
+- TikTok resolver behavior: all TikTok pages use SnapTik/SSSTik first by default, with URL-submission disclosure; no automatic ordinary-extractor fallback. `--no-tiktok-resolver` explicitly selects ordinary extraction instead
 - Retry behavior: use extractor, file, and fragment retries plus concurrent fragment downloads to improve resilience and speed on unstable HLS/media endpoints
 - Result behavior: summarize outcomes with stable status labels such as direct success, HLS fallback success, auth-needed failure, network instability, or restricted audio-only failure
 - Cache behavior: cache keys are salted digests and include all output constraints, including metadata policy; cache files and metrics are user-private and atomically updated
@@ -151,16 +151,16 @@ Use cookies from Chrome for sites that need login state:
 python3 "${CODEX_HOME:-$HOME/.codex}/skills/social-video-downloader/scripts/download_social_video.py" "<url>" --cookies-from-browser chrome
 ```
 
-Use resolver-first routing when the user identifies a TikTok Shop or promoted video:
+Download any TikTok page using the preferred resolver-first route (no extra flag needed):
 
 ```bash
-python3 "${CODEX_HOME:-$HOME/.codex}/skills/social-video-downloader/scripts/download_social_video.py" "<tiktok-url>" --tiktok-shop
+python3 "${CODEX_HOME:-$HOME/.codex}/skills/social-video-downloader/scripts/download_social_video.py" "<tiktok-url>"
 ```
 
-Explicitly allow third-party TikTok resolver submission:
+Use ordinary TikTok extraction only when the user explicitly declines third-party submission or requests this route:
 
 ```bash
-python3 "${CODEX_HOME:-$HOME/.codex}/skills/social-video-downloader/scripts/download_social_video.py" "<tiktok-url>" --tiktok-resolver
+python3 "${CODEX_HOME:-$HOME/.codex}/skills/social-video-downloader/scripts/download_social_video.py" "<tiktok-url>" --no-tiktok-resolver
 ```
 
 Choose a different folder only when the user asks:
@@ -203,10 +203,10 @@ bash "${CODEX_HOME:-$HOME/.codex}/skills/social-video-downloader/scripts/compres
 - The default output is intentionally optimized for Mac playback and presentation workflows, not archival purity; the basic media profile is not a guarantee for every PowerPoint or platform version.
 - The script now avoids wasting time on browsers that are not installed and avoids re-encoding files that already meet its basic H.264/AAC/MP4 profile.
 - TikTok fallback providers are HTTP-only in this stage; no browser or headless-browser automation is required.
-- When `--tiktok-shop` or explicit `--tiktok-resolver` is used, the script discloses that it is submitting the URL to SnapTik and SSSTik. No third-party resolver is called by default.
+- TikTok page downloads submit the URL to SnapTik/SSSTik by default. Disclose this to the user, and respect requests to avoid third-party submission with `--no-tiktok-resolver`. A resolver route is successful only when the final result contains both video and audio; read the actual summary rather than assuming the preferred route succeeded.
 - If the user asks for only audio, this skill is not the right default. Use a separate audio-only flow.
 - If the user asks for the highest quality, pass `--max-height 1080` or run `yt-dlp` manually with an explicit quality request instead of changing the skill default.
-- If a download fails because the platform changed, inspect the `yt-dlp` error first and update the script rather than replacing the workflow.
+- If a download fails because the platform changed, inspect the selected route's error (resolver for default TikTok downloads, `yt-dlp` for other social pages) before changing the workflow.
 - For WhatsApp sharing, recommend sending the result as a Document/File when preserving the encoded quality matters; ordinary gallery/video sending may apply another platform transcode.
 
 ## Resource

@@ -238,7 +238,7 @@ class ResourceBoundaryTests(unittest.TestCase):
 
 
 class CliContractTests(unittest.TestCase):
-    def test_sensitive_defaults_are_opt_in(self) -> None:
+    def test_resolver_defaults_on_but_cookies_and_install_remain_opt_in(self) -> None:
         with unittest.mock.patch.object(
             sys,
             "argv",
@@ -247,6 +247,13 @@ class CliContractTests(unittest.TestCase):
             args = main_mod.parse_args()
         self.assertFalse(args.install_missing)
         self.assertFalse(args.auto_cookies)
+        self.assertTrue(args.tiktok_resolver)
+
+    def test_cli_can_explicitly_disable_tiktok_resolver(self) -> None:
+        with unittest.mock.patch.object(
+            sys, "argv", ["download_social_video.py", "https://www.tiktok.com/@user/video/123456", "--no-tiktok-resolver"]
+        ):
+            args = main_mod.parse_args()
         self.assertFalse(args.tiktok_resolver)
 
     def test_build_command_does_not_embed_metadata_or_force_overwrite_by_default(self) -> None:
@@ -333,6 +340,72 @@ class TikTokResolverParsingTests(unittest.TestCase):
         self.assertEqual(decoded, decoded_html.replace("&amp;", "&"))
         self.assertEqual(tiktok_resolver.media_url_candidates(decoded), ["https://d.rapidcdn.app/v2?token=x&dl=1"])
 
+    def test_current_snaptik_challenge_operations(self) -> None:
+        self.assertEqual(
+            tiktok_resolver.evaluate_snaptik_challenge({"t": "b", "a": 12, "b": 5, "s": 1}),
+            4,
+        )
+        self.assertEqual(
+            tiktok_resolver.evaluate_snaptik_challenge({"t": "r", "n": [1, 2, 3]}),
+            13,
+        )
+        self.assertEqual(
+            tiktok_resolver.evaluate_snaptik_challenge({"t": "c", "w": "abc", "i": 1, "m": 2}),
+            196,
+        )
+        self.assertEqual(
+            tiktok_resolver.evaluate_snaptik_challenge({"t": "m", "a": 7, "b": 8, "c": 3}),
+            45,
+        )
+        self.assertEqual(
+            tiktok_resolver.evaluate_snaptik_challenge({"t": "n", "a": 8, "b": 6, "c": 2}),
+            68,
+        )
+
+    def test_current_snaptik_api_response_is_parsed(self) -> None:
+        with unittest.mock.patch.object(
+            tiktok_resolver,
+            "curl_text_request",
+            side_effect=[
+                "homepage",
+                '{"id":"token-1","p":"encrypted"}',
+                '{"data":{"title":"Current title","downloadUrl":"https://cdn.example/video?token=x","hdDownloadUrl":"https://cdn.example/hd?token=y"}}',
+            ],
+        ) as request, unittest.mock.patch.object(
+            tiktok_resolver, "solve_snaptik_challenge", return_value="token-1:42:e:h"
+        ):
+            candidates, title = tiktok_resolver.snaptik_candidates(
+                "https://www.tiktok.com/@shop/video/123456"
+            )
+
+        self.assertEqual(candidates, ["https://cdn.example/video?token=x", "https://cdn.example/hd?token=y"])
+        self.assertEqual(title, "Current title")
+        self.assertEqual(request.call_args_list[1].args[0], constants.SNAPTIK_TOKEN_URL)
+        self.assertEqual(request.call_args_list[1].kwargs["form_fields"], [])
+        self.assertIn("Content-Type: application/json", request.call_args_list[1].kwargs["headers"])
+        extract_url = request.call_args_list[2].args[0]
+        self.assertIn("/api/extract?url=https%3A%2F%2Fwww.tiktok.com%2F%40shop%2Fvideo%2F123456", extract_url)
+        self.assertIn("X-Verify: token-1:42:e:h", request.call_args_list[2].kwargs["headers"])
+
+    def test_current_ssstik_form_configuration_and_media_link_are_parsed(self) -> None:
+        with unittest.mock.patch.object(
+            tiktok_resolver,
+            "curl_text_request",
+            side_effect=[
+                "<script>var s_furl = 'abc'; var s_tt = 'Vm5BTlIy';</script>",
+                '<p>Current title</p><a href="https://cdn.example/video?token=x">Download</a>',
+            ],
+        ) as request:
+            candidates, title = tiktok_resolver.ssstik_candidates(
+                "https://www.tiktok.com/@shop/video/123456"
+            )
+
+        self.assertEqual(candidates, ["https://cdn.example/video?token=x"])
+        self.assertEqual(title, "Current title")
+        self.assertEqual(request.call_args_list[1].args[0], "https://ssstik.io/abc?url=dl")
+        self.assertIn(("tt", "Vm5BTlIy"), request.call_args_list[1].kwargs["form_fields"])
+        self.assertIn("HX-Trigger: _gcaptcha_pt", request.call_args_list[1].kwargs["headers"])
+
 
 class TikTokResolverRoutingTests(unittest.TestCase):
     def make_options(
@@ -346,7 +419,7 @@ class TikTokResolverRoutingTests(unittest.TestCase):
             ppt_compatible=False,
         )
 
-    def test_known_tiktok_shop_uses_resolver_without_yt_dlp_attempt(self) -> None:
+    def test_default_tiktok_uses_resolver_without_yt_dlp_attempt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             saved_path = str(Path(tmp_dir) / "resolved.mp4")
             with unittest.mock.patch.object(
@@ -367,43 +440,66 @@ class TikTokResolverRoutingTests(unittest.TestCase):
             ):
                 result = main_mod.process_url(
                     "https://www.tiktok.com/@shop/video/123456",
-                    self.make_options(tmp_dir, tiktok_shop=True),
+                    constants.DownloadOptions(output_dir=Path(tmp_dir), ppt_compatible=False),
                     workflow_mod.DownloadServices("yt-dlp", "ffmpeg"),
                     None,
                 )
 
         self.assertTrue(result.ok)
         self.assertEqual(result.route, constants.DownloadRoute.TIKTOK_RESOLVER)
+        self.assertIn("downloaded_tiktok_resolver: snaptik:", result.message)
         self.assertTrue(result.metadata["used_fallback"])
         mock_resolver.assert_called_once()
         mock_ytdlp.assert_not_called()
 
-    def test_audio_only_tiktok_retries_through_resolver(self) -> None:
+    def test_default_dry_run_reports_resolver_route(self) -> None:
+        result = main_mod.process_url(
+            "https://www.tiktok.com/@user/video/123456",
+            constants.DownloadOptions(output_dir=Path("/tmp/output"), dry_run=True),
+            workflow_mod.DownloadServices("yt-dlp", "ffmpeg"), None,
+        )
+        self.assertIn("HTTP resolver providers first", result.message)
+
+    def test_tiktok_direct_media_still_bypasses_page_resolvers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with unittest.mock.patch.object(
+                workflow_mod, "download_direct_media",
+                return_value=constants.RouteResult(True, str(Path(tmp_dir) / "direct.mp4"), constants.DownloadRoute.DIRECT),
+            ) as mock_direct, unittest.mock.patch.object(
+                workflow_mod, "download_tiktok_via_resolvers"
+            ) as mock_resolver, unittest.mock.patch.object(
+                workflow_mod, "media_facts", return_value={"has_video": True, "has_audio": True},
+            ):
+                result = main_mod.process_url(
+                    "https://www.tiktok.com/video.mp4", self.make_options(tmp_dir),
+                    workflow_mod.DownloadServices("yt-dlp", "ffmpeg"), None,
+                )
+        self.assertTrue(result.ok)
+        self.assertEqual(result.route, constants.DownloadRoute.DIRECT)
+        mock_direct.assert_called_once()
+        mock_resolver.assert_not_called()
+
+    def test_audio_only_resolver_result_fails_without_yt_dlp_attempt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             audio_path = Path(tmp_dir) / "audio.m4a"
             audio_path.touch()
-            resolved_path = str(Path(tmp_dir) / "resolved.mp4")
             with unittest.mock.patch.object(
                 workflow_mod,
                 "try_download_with_fallbacks",
                 return_value=(True, str(audio_path), "none"),
-            ), unittest.mock.patch.object(
+            ) as mock_ytdlp, unittest.mock.patch.object(
                 workflow_mod,
                 "download_tiktok_via_resolvers",
                 return_value=constants.RouteResult(
                     True,
-                    resolved_path,
+                    str(audio_path),
                     constants.DownloadRoute.TIKTOK_RESOLVER,
                     "snaptik",
                 ),
             ) as mock_resolver, unittest.mock.patch.object(
                 workflow_mod,
                 "media_facts",
-                side_effect=[
-                    {"has_video": False, "has_audio": True},
-                    {"has_video": True, "has_audio": True},
-                    {"has_video": True, "has_audio": True},
-                ],
+                return_value={"has_video": False, "has_audio": True},
             ):
                 result = main_mod.process_url(
                     "https://www.tiktok.com/@shop/video/123456",
@@ -412,10 +508,28 @@ class TikTokResolverRoutingTests(unittest.TestCase):
                     None,
                 )
 
-        self.assertTrue(result.ok)
+        self.assertFalse(result.ok)
         self.assertEqual(result.route, constants.DownloadRoute.TIKTOK_RESOLVER)
-        self.assertTrue(result.metadata["used_fallback"])
+        self.assertEqual(result.error_code, constants.ErrorCode.AUDIO_ONLY_RESULT)
         mock_resolver.assert_called_once()
+        mock_ytdlp.assert_not_called()
+
+    def test_failed_resolver_does_not_fall_back_to_yt_dlp(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with unittest.mock.patch.object(
+                workflow_mod, "download_tiktok_via_resolvers",
+                return_value=constants.RouteResult(False, None, constants.DownloadRoute.TIKTOK_RESOLVER, "providers failed"),
+            ) as mock_resolver, unittest.mock.patch.object(
+                workflow_mod, "try_download_with_fallbacks"
+            ) as mock_ytdlp:
+                result = main_mod.process_url(
+                    "https://www.tiktok.com/@user/video/123456", self.make_options(tmp_dir),
+                    workflow_mod.DownloadServices("yt-dlp", "ffmpeg"), None,
+                )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.route, constants.DownloadRoute.TIKTOK_RESOLVER)
+        mock_resolver.assert_called_once()
+        mock_ytdlp.assert_not_called()
 
     def test_resolver_opt_out_overrides_tiktok_shop_hint(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

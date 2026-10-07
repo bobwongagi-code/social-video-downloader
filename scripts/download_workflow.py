@@ -240,7 +240,7 @@ def _dry_run_result(url: str, options: DownloadOptions, started_at: float) -> Do
     }
     if is_direct_media_url(url):
         message = "would download direct media"
-    elif options.tiktok_shop and options.tiktok_resolver and is_tiktok_url(url):
+    elif options.tiktok_resolver and is_tiktok_url(url):
         message = "would use HTTP resolver providers first"
     else:
         message = "would use yt-dlp social-page flow"
@@ -286,16 +286,16 @@ def _initial_attempt(
 ) -> AttemptState:
     tiktok_url = is_tiktok_url(url)
     resolver_allowed = options.tiktok_resolver and tiktok_url
-    resolver_first = options.tiktok_shop and resolver_allowed
-    if resolver_first:
-        attempt = _run_tiktok_resolver(url, options, services.ffmpeg, batch_budget)
-    elif is_direct_media_url(url):
+    resolver_first = resolver_allowed and not is_direct_media_url(url)
+    if is_direct_media_url(url):
         attempt = _run_bounded_route(
             lambda: download_direct_media(url, options, services.ffmpeg),
             DownloadRoute.DIRECT,
             options.output_dir,
             batch_budget,
         )
+    elif resolver_first:
+        attempt = _run_tiktok_resolver(url, options, services.ffmpeg, batch_budget)
     else:
         attempt = _run_bounded_route(
             lambda: try_download_with_fallbacks(

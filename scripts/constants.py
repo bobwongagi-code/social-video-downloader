@@ -44,9 +44,9 @@ METRICS_MAX_BYTES = 10 * 1024 * 1024
 MAX_LOG_TAIL_BYTES = 64 * 1024
 TOOL_SEMANTICS_VERSION = "download-v2"
 SNAPTIK_HOME_URL = "https://snaptik.app/en2"
-SNAPTIK_SUBMIT_URL = "https://snaptik.app/abc2.php"
+SNAPTIK_TOKEN_URL = "https://snaptik.app/api/token"
+SNAPTIK_EXTRACT_URL = "https://snaptik.app/api/extract"
 SSSTIK_HOME_URL = "https://ssstik.io/"
-SSSTIK_SUBMIT_URL = "https://ssstik.io/abc?url=dl"
 CACHE_PATH = (
     Path.home() / ".codex" / "skills" / "social-video-downloader" / "cache" / "downloads.json"
 )
@@ -94,7 +94,7 @@ class DownloadOptions:
     cookies_from_browser: str | None = None
     auto_cookies: bool = False
     ppt_compatible: bool = True
-    tiktok_resolver: bool = False
+    tiktok_resolver: bool = True
     tiktok_shop: bool = False
     force: bool = False
     keep_metadata: bool = False

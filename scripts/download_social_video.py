@@ -148,13 +148,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--tiktok-resolver",
         action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Opt in to HTTP resolver providers for TikTok URLs.",
+        default=True,
+        help="Use HTTP resolver providers first for TikTok URLs (default); --no-tiktok-resolver uses yt-dlp instead.",
     )
     parser.add_argument(
         "--tiktok-shop",
         action="store_true",
-        help="Treat TikTok inputs as known Shop/promoted videos and try HTTP resolver providers first.",
+        help="Compatibility hint for TikTok Shop/promoted videos; all TikTok pages now use resolvers by default.",
     )
     parser.add_argument(
         "--force",
@@ -187,8 +187,6 @@ def parse_args() -> argparse.Namespace:
         return args
     if not args.inputs and not args.text_file:
         parser.error("at least one input URL or --text-file is required")
-    if args.tiktok_resolver is None:
-        args.tiktok_resolver = bool(args.tiktok_shop)
     return args
 
 
@@ -206,7 +204,7 @@ def options_for_args(args: argparse.Namespace, output_dir: Path) -> DownloadOpti
         cookies_from_browser=getattr(args, "cookies_from_browser", None),
         auto_cookies=getattr(args, "auto_cookies", False),
         ppt_compatible=getattr(args, "ppt_compatible", True),
-        tiktok_resolver=bool(getattr(args, "tiktok_resolver", False)),
+        tiktok_resolver=bool(getattr(args, "tiktok_resolver", True)),
         tiktok_shop=getattr(args, "tiktok_shop", False),
         force=getattr(args, "force", False),
         keep_metadata=getattr(args, "keep_metadata", False),

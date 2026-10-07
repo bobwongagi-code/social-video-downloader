@@ -8,6 +8,7 @@ This changelog starts from the current public-repository baseline.
 
 ### Changed
 
+- Made HTTP resolvers the default for all TikTok pages, documented third-party URL submission and explicit opt-out, and removed ordinary extraction from the default TikTok path
 - Split the downloader entrypoint into route adapters and workflow orchestration without changing the CLI contract
 - Added typed download options/services at the CLI boundary and made batch-budget exhaustion fail fast instead of waiting forever after completed downloads
 - Added a source-to-installed-runtime synchronization tool and CI verification to prevent skill drift

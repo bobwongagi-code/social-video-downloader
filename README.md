@@ -33,7 +33,7 @@ This project is designed around a different goal: stable, presentation-friendly 
 - Presentation-friendly: normalizes to a basic `H.264 + AAC` MP4 profile only when needed
 - Stable download paths: separates social pages, direct media URLs, and HLS playlists
 - Recovery built in: supports bounded retries, explicit cookie fallback, and a conservative HLS fallback
-- TikTok restricted-video recovery: can use HTTP resolver providers only when the user opts in
+- TikTok resolver-first downloads: try SnapTik then SSSTik by default, with URL-submission disclosure
 - Repeated-work friendly: includes cache reuse and lightweight KPI logging
 - WhatsApp-ready local compression: uses two-pass bitrate budgeting and validates the final H.264/AAC file
 
@@ -50,7 +50,7 @@ Typical supported sources include:
 - Direct media URLs such as `.mp4` and `.m3u8`
 - Local MP4/MOV/M4V/WebM files for WhatsApp compression
 
-Platform support ultimately depends on whether the current `yt-dlp` extractor can access the source.
+Platform support depends on whether the selected route can access the source: HTTP resolvers for TikTok pages by default, `yt-dlp` for other social pages.
 
 ## Default Behavior
 
@@ -62,7 +62,7 @@ Platform support ultimately depends on whether the current `yt-dlp` extractor ca
 - Cookies: never read browser cookies unless `--auto-cookies` or `--cookies-from-browser` is explicit
 - HLS: accept only bounded, unencrypted MPEG-TS fallback playlists; advanced HLS is rejected rather than guessed
 - Cache: key includes URL digest, output directory, quality, basic-profile setting, metadata policy, identity scope, route, and tool version
-- TikTok resolver: disabled by default; `--tiktok-shop` explicitly submits the URL to SnapTik/SSSTik first
+- TikTok resolver: enabled by default for TikTok pages; submits the URL to SnapTik/SSSTik and requires both video and audio. No automatic ordinary-extractor fallback; `--no-tiktok-resolver` selects `yt-dlp` instead
 - Local compression: preserve the source, target the requested size with a 0.90 safety margin, and write a new MP4
 
 ## Choose A Route
@@ -131,10 +131,10 @@ python3 scripts/sync_skill_runtime.py --install
 
 The default target is `${CODEX_HOME:-$HOME/.codex}`. Use `--target-root` to check a temporary or CI installation.
 
-Download a known TikTok Shop or promoted video without waiting for the ordinary TikTok extraction path:
+Download a TikTok page through the preferred HTTP resolver route (including Shop/promoted videos):
 
 ```bash
-python3 scripts/download_social_video.py "<tiktok-url>" --tiktok-shop
+python3 scripts/download_social_video.py "<tiktok-url>"
 ```
 
 ## Example Workflow
@@ -165,8 +165,8 @@ bash scripts/compress_for_whatsapp.sh "/path/to/input.mp4" "/path/to/output.mp4"
 - `--dry-run`: preview without downloading
 - `--install-missing`: explicitly allow Homebrew dependency installation
 - `--auto-cookies`: explicitly allow retries with detected browser cookies
-- `--tiktok-shop`: explicitly submit TikTok Shop/promoted URLs to SnapTik/SSSTik first
-- `--no-tiktok-resolver`: disable third-party TikTok resolver fallback
+- `--tiktok-shop`: compatibility hint for Shop/promoted URLs; no longer needed for resolver-first routing
+- `--no-tiktok-resolver`: decline third-party TikTok submission and use ordinary `yt-dlp` extraction instead
 - `--force`: explicitly replace an existing downloader output
 - `--keep-metadata`: retain extractor metadata when the download route supports it
 - `--kpi-report`: summarize recent real-run metrics
@@ -214,7 +214,7 @@ Local runtime artifacts are intentionally ignored:
 - This project is not affiliated with TikTok, Instagram, Facebook, X/Twitter, YouTube, or Xiaohongshu.
 - Some platforms require login state depending on region and content restrictions.
 - A direct source with no audio is retained and reported as `video_only_source`; a social extraction that is expected to have audio but loses it is reported as `audio_expected_but_missing`.
-- TikTok URLs are submitted to SnapTik/SSSTik only with explicit `--tiktok-shop` or `--tiktok-resolver`; the command prints this disclosure before the request.
+- TikTok page URLs are submitted to SnapTik/SSSTik by default; the command prints this disclosure before the request. Use `--no-tiktok-resolver` to avoid third-party submission. Prior resolver success does not guarantee every future link will download.
 - Logs and cache keys redact or hash URL query data. Do not enable `--keep-metadata` when the output is intended to remove source attribution.
 - The defaults are optimized for day-to-day sharing, playback, and presentation workflows, not archival-quality collection; the basic media profile is not a guarantee for every PowerPoint or platform version.
 - `--dry-run` is read-only and does not create KPI events.
